@@ -80,6 +80,17 @@ prim_defaults = {
 }
 
 
+# Sokol resource handles are 4-byte extern structs. Zig 0.16 lowers an
+# extern-struct parameter passed by value to a widened i64 load, which is
+# undefined behavior for a 4-byte object (ReleaseFast folded a pipeline
+# handle to 0). Emit u32 extern parameters and pass handle.id from the
+# wrappers; the C ABI reads the low 32 bits. Results are unaffected.
+handle_types = [
+    'sg_buffer', 'sg_image', 'sg_pipeline', 'sg_sampler', 'sg_shader', 'sg_view',
+    'scb_cmdbuf', 'sdtx_context', 'sfetch_handle_t', 'sfb_framebuffer',
+    'sgl_context', 'sgl_pipeline',
+]
+
 struct_types = []
 enum_types = []
 enum_items = {}
@@ -285,7 +296,10 @@ def funcdecl_args_c(decl, prefix):
             s += ", "
         param_name = param_decl['name']
         param_type = check_override(f'{func_name}.{param_name}', default=param_decl['type'])
-        s += as_c_arg_type(param_type, prefix)
+        if param_type in handle_types:
+            s += 'u32'
+        else:
+            s += as_c_arg_type(param_type, prefix)
     return s
 
 def funcdecl_args_zig(decl, prefix):
@@ -428,8 +442,10 @@ def gen_func_zig(decl, prefix, tiger_style=False):
             if i > 0:
                 s += ", "
             arg_name = param_decl['name']
-            arg_type = param_decl['type']
-            if is_const_struct_ptr(arg_type):
+            arg_type = check_override(f'{c_func_name}.{arg_name}', default=param_decl['type'])
+            if arg_type in handle_types:
+                s += f"{arg_name}.id"
+            elif is_const_struct_ptr(arg_type):
                 s += f"&{arg_name}"
             elif util.is_string_ptr(arg_type):
                 s += f"@ptrCast({arg_name})"
