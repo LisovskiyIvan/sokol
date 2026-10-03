@@ -395,6 +395,10 @@ typedef uint64_t        GLuint64;
 #define GL_TEXTURE_WRAP_R                              0x8072
 #define GL_TEXTURE_WRAP_S                              0x2802
 #define GL_TEXTURE_WRAP_T                              0x2803
+#define GL_TIME_ELAPSED                                0x88BF
+#define GL_TIMESTAMP                                   0x8E28
+#define GL_QUERY_RESULT                                0x8866
+#define GL_QUERY_RESULT_AVAILABLE                      0x8867
 #define GL_TRIANGLES                                   0x0004
 #define GL_TRIANGLE_STRIP                              0x0005
 #define GL_TRUE                                        1
@@ -543,7 +547,13 @@ typedef uint64_t        GLuint64;
     _GLM_XMACRO(glDrawElementsInstancedBaseVertex, void, (GLenum mode, GLsizei count, GLenum type, const void* indices, GLsizei instancecount, GLint basevertex)) \
     _GLM_XMACRO(glDrawElementsInstancedBaseVertexBaseInstance, void, (GLenum mode, GLsizei count, GLenum type, const void* indices, GLsizei instancecount, GLint basevertex, GLuint baseinstance)) \
     _GLM_XMACRO(glDrawArraysInstancedBaseInstance, void, (GLenum mode, GLint first, GLsizei count, GLsizei instancecount, GLuint baseinstance)) \
-    _GLM_XMACRO(glInvalidateFramebuffer,          void, (GLenum target, GLsizei numAttachments, const GLenum* attachments))
+    _GLM_XMACRO(glInvalidateFramebuffer,          void, (GLenum target, GLsizei numAttachments, const GLenum* attachments)) \
+    _GLM_XMACRO(glGenQueries,                    void, (GLsizei n, GLuint* ids)) \
+    _GLM_XMACRO(glDeleteQueries,                 void, (GLsizei n, const GLuint* ids)) \
+    _GLM_XMACRO(glBeginQuery,                    void, (GLenum target, GLuint id)) \
+    _GLM_XMACRO(glEndQuery,                      void, (GLenum target)) \
+    _GLM_XMACRO(glGetQueryObjectuiv,             void, (GLuint id, GLenum pname, GLuint* params)) \
+    _GLM_XMACRO(glGetQueryObjectui64v,           void, (GLuint id, GLenum pname, GLuint64* params))
 
 // generate GL function prototypes
 #ifdef __cplusplus

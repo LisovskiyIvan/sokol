@@ -250,6 +250,9 @@ extern void gl_mock_set_info_log(const char* msg);
 extern void gl_mock_set_framebuffer_status(GLenum status);
 extern void gl_mock_push_error(GLenum err);
 extern void gl_mock_set_int(GLenum pname, GLint value);   // override a glGetIntegerv limit
+// timer queries (default: available with 1 ms result)
+extern void gl_mock_set_query_available(bool available);
+extern void gl_mock_set_query_ns(uint64_t ns);
 
 #ifdef __cplusplus
 } // extern "C"

@@ -73,6 +73,11 @@
     _MTLM_XMACRO(commandBufferWithUnretainedReferences) \
     _MTLM_XMACRO(enqueue) \
     _MTLM_XMACRO(commit) \
+    _MTLM_XMACRO(supportsCounterSampling) \
+    _MTLM_XMACRO(counterSets) \
+    _MTLM_XMACRO(newCounterSampleBufferWithDescriptor) \
+    _MTLM_XMACRO(resolveCounterRange) \
+    _MTLM_XMACRO(computeCommandEncoderWithDescriptor) \
     _MTLM_XMACRO(addCompletedHandler) \
     _MTLM_XMACRO(presentDrawable) \
     _MTLM_XMACRO(renderCommandEncoderWithDescriptor) \
@@ -129,6 +134,7 @@ typedef enum {
     METAL_MOCK_OBJ_DEPTH_STENCIL,
     METAL_MOCK_OBJ_COMMAND_QUEUE,
     METAL_MOCK_OBJ_COMMAND_BUFFER,
+    METAL_MOCK_OBJ_COUNTER_SAMPLE_BUFFER,
     METAL_MOCK_OBJ_RENDER_ENCODER,
     METAL_MOCK_OBJ_COMPUTE_ENCODER,
     METAL_MOCK_OBJ_DRAWABLE,
@@ -284,6 +290,11 @@ typedef struct {
     metal_mock_pass_attachment_t depth_attachment;
     bool has_stencil_attachment;
     metal_mock_pass_attachment_t stencil_attachment;
+    // counter sample attachment ([0]) when set by the caller
+    bool has_sample_buffer;
+    const void* sample_buffer;
+    uint64_t start_vertex_index, end_vertex_index;
+    uint64_t start_fragment_index, end_fragment_index;
 } metal_mock_render_pass_info_t;
 
 typedef struct {
@@ -325,6 +336,11 @@ typedef struct {
     int num_dispatches;
     int debug_group_depth;
     char label[METAL_MOCK_MAX_STRING];
+    // counter sample attachment ([0]) when created with a descriptor
+    bool from_descriptor;
+    bool has_sample_buffer;
+    const void* sample_buffer;
+    uint64_t start_encoder_index, end_encoder_index;
 } metal_mock_compute_encoder_state_t;
 
 #ifdef __cplusplus
@@ -337,6 +353,8 @@ extern void metal_mock_shutdown(void);
 
 // the mock device, feed into sg_desc.environment.metal.device
 extern const void* metal_mock_device(void);
+// the most recently created command buffer (0 if none yet)
+extern const void* metal_mock_last_command_buffer(void);
 
 // swapchain helpers, feed into sg_swapchain.metal.*, release when done
 extern const void* metal_mock_create_drawable(int width, int height, MTLPixelFormat fmt);
@@ -393,6 +411,15 @@ extern void metal_mock_fail_next(metal_mock_obj_t kind, int n);
 extern void metal_mock_fail_next_after(metal_mock_obj_t kind, int skip, int n);
 extern void metal_mock_set_error_message(const char* msg);
 extern void metal_mock_set_supports_family(MTLGPUFamily family, bool supported);
+// command-buffer GPU timing: mark obj Completed with scripted GPU times,
+// or set a raw status (default after commit is Committed, times 0)
+extern void metal_mock_set_command_buffer_times(const void* obj, double start, double end);
+extern void metal_mock_set_command_buffer_status(const void* obj, int status);
+// counter sampling: stage-boundary timestamp support (default true),
+// scripted sample values (default 1000*(i+1) ns), resolve failure switch
+extern void metal_mock_set_counter_sampling_supported(bool supported);
+extern void metal_mock_set_counter_timestamp(int index, uint64_t value);
+extern void metal_mock_set_counter_resolve_nil(bool fails);
 
 #ifdef __cplusplus
 } // extern "C"

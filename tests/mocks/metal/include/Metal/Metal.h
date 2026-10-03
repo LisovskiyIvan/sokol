@@ -47,6 +47,12 @@
 #define MTLRenderPassStencilAttachmentDescriptor _mtlm_MTLRenderPassStencilAttachmentDescriptor
 #define MTLRenderPassColorAttachmentDescriptorArray _mtlm_MTLRenderPassColorAttachmentDescriptorArray
 #define MTLRenderPassDescriptor _mtlm_MTLRenderPassDescriptor
+#define MTLCounterSampleBufferDescriptor _mtlm_MTLCounterSampleBufferDescriptor
+#define MTLRenderPassSampleBufferAttachmentDescriptor _mtlm_MTLRenderPassSampleBufferAttachmentDescriptor
+#define MTLRenderPassSampleBufferAttachmentDescriptorArray _mtlm_MTLRenderPassSampleBufferAttachmentDescriptorArray
+#define MTLComputePassSampleBufferAttachmentDescriptor _mtlm_MTLComputePassSampleBufferAttachmentDescriptor
+#define MTLComputePassSampleBufferAttachmentDescriptorArray _mtlm_MTLComputePassSampleBufferAttachmentDescriptorArray
+#define MTLComputePassDescriptor _mtlm_MTLComputePassDescriptor
 
 //== MTLTypes.h ================================================================
 
@@ -626,11 +632,64 @@ typedef NS_ENUM(NSUInteger, MTLStoreAction) {
 - (MTLRenderPassColorAttachmentDescriptor* _Nonnull)objectAtIndexedSubscript:(NSUInteger)attachmentIndex;
 @end
 
+
+//== MTLCounters.h (timestamp subset) ==========================================
+
+#define MTLCounterErrorValue ((uint64_t)~0ULL)
+#define MTLCounterDontSample ((NSUInteger)-1)
+#define MTLCommonCounterSetTimestamp @"timestamp"
+
+@protocol MTLCounterSet <NSObject>
+@property (readonly, copy) NSString* _Nonnull name;
+@end
+
+@interface MTLCounterSampleBufferDescriptor : NSObject
+@property (nullable, readwrite, nonatomic, strong) id<MTLCounterSet> counterSet;
+@property (readwrite, nonatomic) MTLStorageMode storageMode;
+@property (readwrite, nonatomic) NSUInteger sampleCount;
+@end
+
+@protocol MTLCounterSampleBuffer <NSObject>
+@property (readonly) NSUInteger sampleCount;
+- (NSData* _Nullable)resolveCounterRange:(NSRange)range;
+@end
+
+//== MTLRenderPass sample-buffer attachments ===================================
+
+@interface MTLRenderPassSampleBufferAttachmentDescriptor : NSObject
+@property (nullable, nonatomic, strong) id<MTLCounterSampleBuffer> sampleBuffer;
+@property (nonatomic) NSUInteger startOfVertexSampleIndex;
+@property (nonatomic) NSUInteger endOfVertexSampleIndex;
+@property (nonatomic) NSUInteger startOfFragmentSampleIndex;
+@property (nonatomic) NSUInteger endOfFragmentSampleIndex;
+@end
+
+@interface MTLRenderPassSampleBufferAttachmentDescriptorArray : NSObject
+- (MTLRenderPassSampleBufferAttachmentDescriptor* _Nonnull)objectAtIndexedSubscript:(NSUInteger)attachmentIndex;
+@end
+
+//== MTLComputePass.h (sampled subset) ========================================
+
+@interface MTLComputePassSampleBufferAttachmentDescriptor : NSObject
+@property (nullable, nonatomic, strong) id<MTLCounterSampleBuffer> sampleBuffer;
+@property (nonatomic) NSUInteger startOfEncoderSampleIndex;
+@property (nonatomic) NSUInteger endOfEncoderSampleIndex;
+@end
+
 @interface MTLRenderPassDescriptor : NSObject
 + (MTLRenderPassDescriptor* _Nonnull)renderPassDescriptor;
 @property (readonly) MTLRenderPassColorAttachmentDescriptorArray* _Nonnull colorAttachments;
 @property (nullable, strong, nonatomic) MTLRenderPassDepthAttachmentDescriptor* depthAttachment;
 @property (nullable, strong, nonatomic) MTLRenderPassStencilAttachmentDescriptor* stencilAttachment;
+@property (readonly) MTLRenderPassSampleBufferAttachmentDescriptorArray* _Nonnull sampleBufferAttachments;
+@end
+@interface MTLComputePassSampleBufferAttachmentDescriptorArray : NSObject
+- (MTLComputePassSampleBufferAttachmentDescriptor* _Nonnull)objectAtIndexedSubscript:(NSUInteger)attachmentIndex;
+@end
+
+@interface MTLComputePassDescriptor : NSObject
++ (MTLComputePassDescriptor* _Nonnull)computePassDescriptor;
+@property (readonly) MTLComputePassSampleBufferAttachmentDescriptorArray* _Nonnull sampleBufferAttachments;
 @end
 
 //== MTLCommandEncoder.h =======================================================
@@ -738,16 +797,29 @@ typedef struct {
 
 //== MTLCommandBuffer.h ========================================================
 
+typedef NS_ENUM(NSUInteger, MTLCommandBufferStatus) {
+    MTLCommandBufferStatusNotEnqueued = 0,
+    MTLCommandBufferStatusEnqueued = 1,
+    MTLCommandBufferStatusCommitted = 2,
+    MTLCommandBufferStatusScheduled = 3,
+    MTLCommandBufferStatusCompleted = 4,
+    MTLCommandBufferStatusError = 5,
+};
+
 @protocol MTLCommandBuffer;
 typedef void (^MTLCommandBufferHandler)(id<MTLCommandBuffer> _Nonnull);
 
 @protocol MTLCommandBuffer <NSObject>
+@property (readonly) MTLCommandBufferStatus status;
+@property (readonly) CFTimeInterval GPUStartTime;
+@property (readonly) CFTimeInterval GPUEndTime;
 - (void)enqueue;
 - (void)commit;
 - (void)addCompletedHandler:(MTLCommandBufferHandler _Nonnull)block;
 - (void)presentDrawable:(id<MTLDrawable> _Nonnull)drawable;
 - (id<MTLRenderCommandEncoder> _Nullable)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor* _Nonnull)renderPassDescriptor;
 - (id<MTLComputeCommandEncoder> _Nullable)computeCommandEncoder;
+- (id<MTLComputeCommandEncoder> _Nullable)computeCommandEncoderWithDescriptor:(MTLComputePassDescriptor* _Nonnull)descriptor;
 @end
 
 //== MTLCommandQueue.h =========================================================
@@ -777,8 +849,21 @@ typedef NS_ENUM(NSInteger, MTLGPUFamily) {
     MTLGPUFamilyMetal3 = 5001,
 };
 
+// counter sampling points (order matches the real SDK)
+typedef NS_ENUM(NSUInteger, MTLCounterSamplingPoint) {
+    MTLCounterSamplingPointAtStageBoundary = 0,
+    MTLCounterSamplingPointAtDrawBoundary = 1,
+    MTLCounterSamplingPointAtDispatchBoundary = 2,
+    MTLCounterSamplingPointAtTileDispatchBoundary = 3,
+    MTLCounterSamplingPointAtBlitBoundary = 4,
+};
+
 @protocol MTLDevice <NSObject>
 - (BOOL)supportsFamily:(MTLGPUFamily)gpuFamily;
+- (BOOL)supportsCounterSampling:(MTLCounterSamplingPoint)samplingPoint;
+@property (readonly, nullable) NSArray<id<MTLCounterSet>>* counterSets;
+- (id<MTLCounterSampleBuffer> _Nullable)newCounterSampleBufferWithDescriptor:(MTLCounterSampleBufferDescriptor* _Nonnull)descriptor
+                                                                      error:(NSError* _Nullable* _Nullable)error;
 - (id<MTLCommandQueue> _Nullable)newCommandQueue;
 - (id<MTLBuffer> _Nullable)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options;
 - (id<MTLBuffer> _Nullable)newBufferWithBytes:(const void* _Nonnull)pointer length:(NSUInteger)length options:(MTLResourceOptions)options;

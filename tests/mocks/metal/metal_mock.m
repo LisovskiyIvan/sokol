@@ -37,6 +37,7 @@ static void _mtlm_panic(const char* msg, const char* file, int line) {
 
 #define _MTLM_MAX_OBJECTS (1024)
 #define _MTLM_MAX_FAMILIES (16)
+#define _MTLM_MAX_COUNTER_SAMPLES (512)
 #define _MTLM_MAX_PASS_COLOR_ATTS (METAL_MOCK_MAX_COLOR_ATTACHMENTS)
 #define _MTLM_MAX_PIP_COLOR_ATTS (METAL_MOCK_MAX_COLOR_ATTACHMENTS)
 #define _MTLM_MAX_VERTEX_ATTRS (METAL_MOCK_MAX_VERTEX_ATTRIBUTES)
@@ -72,6 +73,12 @@ static struct {
     metal_mock_render_pass_info_t last_render_pass;
     metal_mock_render_encoder_state_t render_encoder_state;
     metal_mock_compute_encoder_state_t compute_encoder_state;
+    const void* last_cmdbuf;
+    // GPU timing script state
+    bool counter_supported;
+    uint64_t counter_ts[_MTLM_MAX_COUNTER_SAMPLES];
+    int counter_ts_n;
+    bool counter_resolve_nil;
 } _mtlm;
 
 //== helpers ===================================================================
@@ -511,6 +518,7 @@ static NSError* _mtlm_error(void) {
         _colorAttachments = [[MTLRenderPassColorAttachmentDescriptorArray alloc] init];
         _depthAttachment = [[MTLRenderPassDepthAttachmentDescriptor alloc] init];
         _stencilAttachment = [[MTLRenderPassStencilAttachmentDescriptor alloc] init];
+        _sampleBufferAttachments = [[MTLRenderPassSampleBufferAttachmentDescriptorArray alloc] init];
     }
     return self;
 }
@@ -518,6 +526,94 @@ static NSError* _mtlm_error(void) {
     [_colorAttachments release];
     [_depthAttachment release];
     [_stencilAttachment release];
+    [_sampleBufferAttachments release];
+    [super dealloc];
+}
+@end
+
+//== counter descriptor classes =================================================
+
+@implementation MTLCounterSampleBufferDescriptor
+- (void)dealloc {
+    [_counterSet release];
+    [super dealloc];
+}
+@end
+
+@implementation MTLRenderPassSampleBufferAttachmentDescriptor
+- (void)dealloc {
+    [_sampleBuffer release];
+    [super dealloc];
+}
+@end
+
+@implementation MTLRenderPassSampleBufferAttachmentDescriptorArray {
+    NSMutableArray* _items;
+}
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        // sokol only ever uses attachment [0]
+        _items = [[NSMutableArray alloc] initWithCapacity:1];
+        MTLRenderPassSampleBufferAttachmentDescriptor* item = [[MTLRenderPassSampleBufferAttachmentDescriptor alloc] init];
+        [_items addObject:item];
+        [item release];
+    }
+    return self;
+}
+- (void)dealloc {
+    [_items release];
+    [super dealloc];
+}
+- (MTLRenderPassSampleBufferAttachmentDescriptor*)objectAtIndexedSubscript:(NSUInteger)attachmentIndex {
+    _MTLM_ASSERT(attachmentIndex < 1);
+    return [_items objectAtIndex:attachmentIndex];
+}
+@end
+
+@implementation MTLComputePassSampleBufferAttachmentDescriptor
+- (void)dealloc {
+    [_sampleBuffer release];
+    [super dealloc];
+}
+@end
+
+@implementation MTLComputePassSampleBufferAttachmentDescriptorArray {
+    NSMutableArray* _items;
+}
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        _items = [[NSMutableArray alloc] initWithCapacity:1];
+        MTLComputePassSampleBufferAttachmentDescriptor* item = [[MTLComputePassSampleBufferAttachmentDescriptor alloc] init];
+        [_items addObject:item];
+        [item release];
+    }
+    return self;
+}
+- (void)dealloc {
+    [_items release];
+    [super dealloc];
+}
+- (MTLComputePassSampleBufferAttachmentDescriptor*)objectAtIndexedSubscript:(NSUInteger)attachmentIndex {
+    _MTLM_ASSERT(attachmentIndex < 1);
+    return [_items objectAtIndex:attachmentIndex];
+}
+@end
+
+@implementation MTLComputePassDescriptor
++ (MTLComputePassDescriptor*)computePassDescriptor {
+    return [[[MTLComputePassDescriptor alloc] init] autorelease];
+}
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        _sampleBufferAttachments = [[MTLComputePassSampleBufferAttachmentDescriptorArray alloc] init];
+    }
+    return self;
+}
+- (void)dealloc {
+    [_sampleBufferAttachments release];
     [super dealloc];
 }
 @end
@@ -580,6 +676,49 @@ static NSError* _mtlm_error(void) {
 }
 @end
 
+// timestamp counter set (transient, not tracked): name matches the common set
+@interface _mtlm_counter_set : NSObject <MTLCounterSet>
+@end
+
+@implementation _mtlm_counter_set
+- (NSString*)name {
+    return MTLCommonCounterSetTimestamp;
+}
+@end
+
+@interface _mtlm_counter_sample_buffer : _mtlm_obj <MTLCounterSampleBuffer> {
+@public
+    NSUInteger num_samples;
+}
+@end
+
+@implementation _mtlm_counter_sample_buffer
+- (NSUInteger)sampleCount {
+    return num_samples;
+}
+- (NSData*)resolveCounterRange:(NSRange)range {
+    _mtlm_log(METAL_MOCK_FUNC_resolveCounterRange, self);
+    if (_mtlm.counter_resolve_nil) {
+        return nil;
+    }
+    NSMutableData* data = [NSMutableData dataWithLength:range.length * sizeof(uint64_t)];
+    uint64_t* out = (uint64_t*)[data mutableBytes];
+    for (NSUInteger i = 0; i < range.length; i++) {
+        const NSUInteger idx = range.location + i;
+        uint64_t v;
+        if (idx >= num_samples) {
+            v = MTLCounterErrorValue;
+        } else if ((int)idx < _mtlm.counter_ts_n) {
+            v = _mtlm.counter_ts[idx];
+        } else {
+            v = (uint64_t)(1000 * (idx + 1));
+        }
+        out[i] = v;
+    }
+    return data;
+}
+@end
+
 @interface _mtlm_render_encoder : _mtlm_obj <MTLRenderCommandEncoder>
 @end
 
@@ -589,6 +728,9 @@ static NSError* _mtlm_error(void) {
 @interface _mtlm_command_buffer : _mtlm_obj <MTLCommandBuffer> {
 @public
     NSMutableArray* handlers;
+    MTLCommandBufferStatus cb_status;
+    CFTimeInterval gpu_start;
+    CFTimeInterval gpu_end;
 }
 - (void)runCompletedHandlers;
 @end
@@ -1105,6 +1247,15 @@ static void _mtlm_snapshot_pass(MTLRenderPassDescriptor* desc) {
         _mtlm_snapshot_att(&dst->stencil_attachment, desc.stencilAttachment);
         dst->stencil_attachment.clear_stencil = desc.stencilAttachment.clearStencil;
     }
+    MTLRenderPassSampleBufferAttachmentDescriptor* sb = desc.sampleBufferAttachments[0];
+    if (nil != sb.sampleBuffer) {
+        dst->has_sample_buffer = true;
+        dst->sample_buffer = sb.sampleBuffer;
+        dst->start_vertex_index = sb.startOfVertexSampleIndex;
+        dst->end_vertex_index = sb.endOfVertexSampleIndex;
+        dst->start_fragment_index = sb.startOfFragmentSampleIndex;
+        dst->end_fragment_index = sb.endOfFragmentSampleIndex;
+    }
 }
 
 @implementation _mtlm_command_buffer
@@ -1113,6 +1264,7 @@ static void _mtlm_snapshot_pass(MTLRenderPassDescriptor* desc) {
     self = [super initWithKind:kind];
     if (self) {
         handlers = [[NSMutableArray alloc] init];
+        cb_status = MTLCommandBufferStatusCommitted;
     }
     return self;
 }
@@ -1134,6 +1286,18 @@ static void _mtlm_snapshot_pass(MTLRenderPassDescriptor* desc) {
 
 - (void)enqueue {
     _mtlm_log(METAL_MOCK_FUNC_enqueue, self);
+}
+
+- (MTLCommandBufferStatus)status {
+    return cb_status;
+}
+
+- (CFTimeInterval)GPUStartTime {
+    return gpu_start;
+}
+
+- (CFTimeInterval)GPUEndTime {
+    return gpu_end;
 }
 
 - (void)commit {
@@ -1179,6 +1343,27 @@ static void _mtlm_snapshot_pass(MTLRenderPassDescriptor* desc) {
     _mtlm_compute_encoder* enc = [[_mtlm_compute_encoder alloc] initWithKind:METAL_MOCK_OBJ_COMPUTE_ENCODER];
     return [enc autorelease];
 }
+
+- (id<MTLComputeCommandEncoder>)computeCommandEncoderWithDescriptor:(MTLComputePassDescriptor*)descriptor {
+    metal_mock_call_t* c = _mtlm_log(METAL_MOCK_FUNC_computeCommandEncoderWithDescriptor, self);
+    c->num_args = 1;
+    c->args[0].p = descriptor;
+    if (_mtlm_fail(METAL_MOCK_OBJ_COMPUTE_ENCODER)) {
+        return nil;
+    }
+    memset(&_mtlm.compute_encoder_state, 0, sizeof(_mtlm.compute_encoder_state));
+    metal_mock_compute_encoder_state_t* st = &_mtlm.compute_encoder_state;
+    st->from_descriptor = true;
+    MTLComputePassSampleBufferAttachmentDescriptor* att = descriptor.sampleBufferAttachments[0];
+    if (nil != att.sampleBuffer) {
+        st->has_sample_buffer = true;
+        st->sample_buffer = att.sampleBuffer;
+        st->start_encoder_index = att.startOfEncoderSampleIndex;
+        st->end_encoder_index = att.endOfEncoderSampleIndex;
+    }
+    _mtlm_compute_encoder* enc = [[_mtlm_compute_encoder alloc] initWithKind:METAL_MOCK_OBJ_COMPUTE_ENCODER];
+    return [enc autorelease];
+}
 @end
 
 @implementation _mtlm_command_queue
@@ -1189,6 +1374,7 @@ static void _mtlm_snapshot_pass(MTLRenderPassDescriptor* desc) {
         return nil;
     }
     _mtlm_command_buffer* cmd_buf = [[_mtlm_command_buffer alloc] initWithKind:METAL_MOCK_OBJ_COMMAND_BUFFER];
+    _mtlm.last_cmdbuf = cmd_buf;
     return [cmd_buf autorelease];
 }
 
@@ -1198,6 +1384,7 @@ static void _mtlm_snapshot_pass(MTLRenderPassDescriptor* desc) {
         return nil;
     }
     _mtlm_command_buffer* cmd_buf = [[_mtlm_command_buffer alloc] initWithKind:METAL_MOCK_OBJ_COMMAND_BUFFER];
+    _mtlm.last_cmdbuf = cmd_buf;
     return [cmd_buf autorelease];
 }
 @end
@@ -1222,6 +1409,53 @@ static void _mtlm_snapshot_pass(MTLRenderPassDescriptor* desc) {
         }
     }
     return YES;
+}
+
+- (BOOL)supportsCounterSampling:(MTLCounterSamplingPoint)samplingPoint {
+    metal_mock_call_t* c = _mtlm_log(METAL_MOCK_FUNC_supportsCounterSampling, self);
+    c->num_args = 1;
+    c->args[0].u = samplingPoint;
+    if (samplingPoint != MTLCounterSamplingPointAtStageBoundary) {
+        return NO;
+    }
+    return _mtlm.counter_supported ? YES : NO;
+}
+
+- (NSArray<id<MTLCounterSet>>*)counterSets {
+    _mtlm_log(METAL_MOCK_FUNC_counterSets, self);
+    _mtlm_counter_set* set = [[_mtlm_counter_set alloc] init];
+    NSArray* arr = [NSArray arrayWithObject:set];
+    [set release];
+    return arr;
+}
+
+- (id<MTLCounterSampleBuffer>)newCounterSampleBufferWithDescriptor:(MTLCounterSampleBufferDescriptor*)descriptor
+                                                             error:(NSError**)error
+{
+    metal_mock_call_t* c = _mtlm_log(METAL_MOCK_FUNC_newCounterSampleBufferWithDescriptor, self);
+    c->num_args = 2;
+    c->args[0].u = descriptor.sampleCount;
+    c->args[1].u = descriptor.storageMode;
+    if (_mtlm_fail(METAL_MOCK_OBJ_COUNTER_SAMPLE_BUFFER)) {
+        if (error) {
+            *error = _mtlm_error();
+        }
+        return nil;
+    }
+    // the timing path always asks for the shared timestamp set
+    if ((nil == descriptor.counterSet) ||
+        ![descriptor.counterSet.name isEqualToString:MTLCommonCounterSetTimestamp] ||
+        (descriptor.storageMode != MTLStorageModeShared) ||
+        (descriptor.sampleCount == 0))
+    {
+        if (error) {
+            *error = _mtlm_error();
+        }
+        return nil;
+    }
+    _mtlm_counter_sample_buffer* sb = [[_mtlm_counter_sample_buffer alloc] initWithKind:METAL_MOCK_OBJ_COUNTER_SAMPLE_BUFFER];
+    sb->num_samples = descriptor.sampleCount;
+    return sb;
 }
 
 - (id<MTLCommandQueue>)newCommandQueue {
@@ -1486,6 +1720,7 @@ void metal_mock_setup(void) {
     memset(&_mtlm, 0, sizeof(_mtlm));
     _mtlm.valid = true;
     _mtlm.pool = [[NSAutoreleasePool alloc] init];
+    _mtlm.counter_supported = true;
     strncpy(_mtlm.err_msg, "metal_mock: injected failure", METAL_MOCK_MAX_STRING - 1);
     if (nil == _mtlm_the_device) {
         _mtlm_the_device = [[_mtlm_device alloc] init];
@@ -1508,6 +1743,11 @@ void metal_mock_drain_pool(void) {
 const void* metal_mock_device(void) {
     _MTLM_ASSERT(_mtlm.valid);
     return _mtlm_the_device;
+}
+
+const void* metal_mock_last_command_buffer(void) {
+    _MTLM_ASSERT(_mtlm.valid);
+    return _mtlm.last_cmdbuf;
 }
 
 const void* metal_mock_create_texture(int width, int height, MTLPixelFormat fmt, int sample_count) {
@@ -1752,4 +1992,41 @@ void metal_mock_set_supports_family(MTLGPUFamily family, bool supported) {
     _mtlm.families[_mtlm.num_families].family = family;
     _mtlm.families[_mtlm.num_families].supported = supported;
     _mtlm.num_families++;
+}
+
+static _mtlm_command_buffer* _mtlm_cmdbuf_for(const void* obj) {
+    if (!_mtlm_is_obj(obj, METAL_MOCK_OBJ_COMMAND_BUFFER)) {
+        return nil;
+    }
+    return (_mtlm_command_buffer*)obj;
+}
+
+void metal_mock_set_command_buffer_times(const void* obj, double start, double end) {
+    _mtlm_command_buffer* cb = _mtlm_cmdbuf_for(obj);
+    _MTLM_ASSERT(nil != cb);
+    cb->cb_status = MTLCommandBufferStatusCompleted;
+    cb->gpu_start = start;
+    cb->gpu_end = end;
+}
+
+void metal_mock_set_command_buffer_status(const void* obj, int status) {
+    _mtlm_command_buffer* cb = _mtlm_cmdbuf_for(obj);
+    _MTLM_ASSERT(nil != cb);
+    cb->cb_status = (MTLCommandBufferStatus)status;
+}
+
+void metal_mock_set_counter_sampling_supported(bool supported) {
+    _mtlm.counter_supported = supported;
+}
+
+void metal_mock_set_counter_timestamp(int index, uint64_t value) {
+    _MTLM_ASSERT((index >= 0) && (index < _MTLM_MAX_COUNTER_SAMPLES));
+    _mtlm.counter_ts[index] = value;
+    if (index >= _mtlm.counter_ts_n) {
+        _mtlm.counter_ts_n = index + 1;
+    }
+}
+
+void metal_mock_set_counter_resolve_nil(bool fails) {
+    _mtlm.counter_resolve_nil = fails;
 }

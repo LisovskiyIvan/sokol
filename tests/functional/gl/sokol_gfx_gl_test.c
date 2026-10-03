@@ -1423,7 +1423,278 @@ UTEST(sokol_gfx_gl, storage_image_binding_uses_bindImageTexture) {
 #endif
 
 //------------------------------------------------------------------------------
-//  no-leaks full lifecycle
+ //  GPU timings (GL_TIME_ELAPSED pools, GLCORE only)
+//------------------------------------------------------------------------------
+#if defined(SOKOL_GLCORE)
+static void timed_all_scopes(void) {
+    for (int p = 0; p < 3; p++) {
+        sg_gpu_timing_scope_begin(p);
+        sg_gpu_timing_scope_end(p);
+    }
+}
+
+UTEST(sokol_gfx_gl, timing_no_context) {
+    // fail-closed without an sg context: no-ops, -1, false, 0, no crash
+    sg_set_gpu_timing_enabled(true);
+    T(!sg_gpu_frame_timing_supported());
+    T(!sg_gpu_scope_timing_supported());
+    T(sg_query_gpu_frame_ms() < 0.0f);
+    T(sg_query_gpu_scope_ms(0) < 0.0f);
+    T(sg_query_gpu_frame_index() == 0);
+    T(sg_query_gpu_scope_frame_index(0) == 0);
+    sg_gpu_timing_scope_begin(0);
+    sg_gpu_timing_scope_end(0);
+}
+
+UTEST(sokol_gfx_gl, timing_default_off) {
+    setup();
+    // caps ignore the enabled intent, queries stay fail-closed
+    T(sg_gpu_frame_timing_supported());
+    T(sg_gpu_scope_timing_supported());
+    T(sg_query_gpu_frame_ms() < 0.0f);
+    T(sg_query_gpu_scope_ms(1) < 0.0f);
+    T(sg_query_gpu_frame_index() == 0);
+    T(sg_query_gpu_scope_frame_index(1) == 0);
+    T(sg_query_gpu_scope_ms(-1) < 0.0f);
+    T(sg_query_gpu_scope_ms(16) < 0.0f);
+    T(sg_query_gpu_scope_frame_index(16) == 0);
+    // disabled brackets encode nothing
+    timed_all_scopes();
+    T(gl_mock_count_calls(GL_MOCK_FUNC_glBeginQuery) == 0);
+    teardown();
+}
+
+UTEST(sokol_gfx_gl, timing_scope_basic) {
+    setup();
+    sg_set_gpu_timing_enabled(true);
+    sg_gpu_timing_scope_begin(0);
+    sg_gpu_timing_scope_end(0);
+    // mock completes with 1 ms immediately: last-completed, tagged frame 1
+    T(sg_query_gpu_scope_ms(0) == 1.0f);
+    T(sg_query_gpu_scope_frame_index(0) == 1);
+    T(sg_query_gpu_scope_ms(1) < 0.0f);
+    teardown();
+}
+
+UTEST(sokol_gfx_gl, timing_frame_sum_same_tag) {
+    setup();
+    sg_set_gpu_timing_enabled(true);
+    timed_all_scopes();
+    T(sg_query_gpu_frame_ms() == 3.0f);
+    T(sg_query_gpu_frame_index() == 1);
+    // resampling one scope in a new frame mixes tags: frame fails closed
+    sg_commit();    // frame 1 -> 2
+    sg_gpu_timing_scope_begin(0);
+    sg_gpu_timing_scope_end(0);
+    T(sg_query_gpu_scope_ms(0) == 1.0f);
+    T(sg_query_gpu_scope_frame_index(0) == 2);
+    T(sg_query_gpu_scope_ms(1) == 1.0f);
+    T(sg_query_gpu_scope_frame_index(1) == 1);
+    T(sg_query_gpu_frame_ms() < 0.0f);
+    T(sg_query_gpu_frame_index() == 0);
+    // all scopes resampled in frame 2: sum again
+    timed_all_scopes();
+    T(sg_query_gpu_frame_ms() == 3.0f);
+    T(sg_query_gpu_frame_index() == 2);
+    teardown();
+}
+
+UTEST(sokol_gfx_gl, timing_scope_ms_index_pairing) {
+    // the index getter reports the tag of the LAST ms query verbatim and
+    // never reaps: a sample completing between the paired calls must not
+    // retag the already-served ms value
+    setup();
+    sg_set_gpu_timing_enabled(true);
+    // sample A in frame 1 at 1 ms, published by its ms query
+    sg_gpu_timing_scope_begin(0);
+    sg_gpu_timing_scope_end(0);
+    T(sg_query_gpu_scope_ms(0) == 1.0f);
+    T(sg_query_gpu_scope_frame_index(0) == 1);
+    // sample B in frame 2 at 2 ms, held back while unavailable
+    gl_mock_set_query_ns(2000000);
+    gl_mock_set_query_available(false);
+    sg_commit();    // frame 1 -> 2
+    sg_gpu_timing_scope_begin(0);
+    sg_gpu_timing_scope_end(0);
+    // ms query serves the OLD pair (B not ready): positive old value
+    T(sg_query_gpu_scope_ms(0) == 1.0f);
+    // B completes between the paired calls: the index still reports the
+    // old tag (an index-side reap would retag to 2 here)
+    gl_mock_set_query_available(true);
+    T(sg_query_gpu_scope_frame_index(0) == 1);
+    // the next ms query picks up B with its own tag
+    T(sg_query_gpu_scope_ms(0) == 2.0f);
+    T(sg_query_gpu_scope_frame_index(0) == 2);
+    teardown();
+}
+
+UTEST(sokol_gfx_gl, timing_scope_high_ids) {
+    // scopes are caller-defined ids in [0, SG_MAX_GPU_TIMING_SCOPES):
+    // high ids sample and aggregate exactly like low ones
+    setup();
+    sg_set_gpu_timing_enabled(true);
+    for (int s = 0; s < SG_MAX_GPU_TIMING_SCOPES; s++) {
+        sg_gpu_timing_scope_begin(s);
+        sg_gpu_timing_scope_end(s);
+    }
+    T(sg_query_gpu_scope_ms(0) == 1.0f);
+    T(sg_query_gpu_scope_ms(7) == 1.0f);
+    T(sg_query_gpu_scope_ms(15) == 1.0f);
+    T(sg_query_gpu_scope_frame_index(7) == 1);
+    T(sg_query_gpu_scope_frame_index(15) == 1);
+    // frame sums all 16 same-tag samples
+    T(sg_query_gpu_frame_ms() == 16.0f);
+    T(sg_query_gpu_frame_index() == 1);
+    // boundary ids fail closed
+    T(sg_query_gpu_scope_ms(16) < 0.0f);
+    T(sg_query_gpu_scope_ms(-1) < 0.0f);
+    T(sg_query_gpu_scope_frame_index(16) == 0);
+    teardown();
+}
+
+UTEST(sokol_gfx_gl, timing_frame_ms_index_pairing) {
+    // same pairing rule for the frame getters: the frame index is the tag
+    // of the last frame ms query, not a fresh drain
+    setup();
+    sg_set_gpu_timing_enabled(true);
+    timed_all_scopes();
+    T(sg_query_gpu_frame_ms() == 3.0f);
+    T(sg_query_gpu_frame_index() == 1);
+    // frame 2 resamples everything at 2 ms, held back while unavailable
+    gl_mock_set_query_ns(2000000);
+    gl_mock_set_query_available(false);
+    sg_commit();    // frame 1 -> 2
+    timed_all_scopes();
+    T(sg_query_gpu_frame_ms() == 3.0f);
+    // everything completes between the paired calls: index stays old
+    gl_mock_set_query_available(true);
+    T(sg_query_gpu_frame_index() == 1);
+    T(sg_query_gpu_frame_ms() == 6.0f);
+    T(sg_query_gpu_frame_index() == 2);
+    teardown();
+}
+
+UTEST(sokol_gfx_gl, timing_not_ready) {
+    setup();
+    gl_mock_set_query_available(false);
+    sg_set_gpu_timing_enabled(true);
+    timed_all_scopes();
+    T(sg_query_gpu_scope_ms(0) < 0.0f);
+    T(sg_query_gpu_frame_ms() < 0.0f);
+    T(sg_query_gpu_scope_frame_index(0) == 0);
+    // queries retire in order once available
+    gl_mock_set_query_available(true);
+    T(sg_query_gpu_scope_ms(0) == 1.0f);
+    T(sg_query_gpu_frame_ms() == 3.0f);
+    teardown();
+}
+
+UTEST(sokol_gfx_gl, timing_zero_ms_valid) {
+    setup();
+    gl_mock_set_query_ns(0);
+    sg_set_gpu_timing_enabled(true);
+    sg_gpu_timing_scope_begin(1);
+    sg_gpu_timing_scope_end(1);
+    // valid zero is a real sample, not "not ready"
+    T(sg_query_gpu_scope_ms(1) == 0.0f);
+    T(sg_query_gpu_scope_frame_index(1) == 1);
+    T(sg_query_gpu_frame_ms() == 0.0f);
+    teardown();
+}
+
+UTEST(sokol_gfx_gl, timing_toggle) {
+    setup();
+    sg_set_gpu_timing_enabled(true);
+    sg_set_gpu_timing_enabled(true);  // idempotent repeat
+    sg_gpu_timing_scope_begin(0);
+    sg_gpu_timing_scope_end(0);
+    T(sg_query_gpu_scope_ms(0) == 1.0f);
+    sg_set_gpu_timing_enabled(false);
+    T(sg_query_gpu_scope_ms(0) < 0.0f);
+    T(sg_query_gpu_frame_ms() < 0.0f);
+    T(gl_mock_count_calls(GL_MOCK_FUNC_glDeleteQueries) > 0);
+    // re-enable starts clean
+    sg_set_gpu_timing_enabled(true);
+    T(sg_query_gpu_scope_ms(0) < 0.0f);
+    sg_gpu_timing_scope_begin(2);
+    sg_gpu_timing_scope_end(2);
+    T(sg_query_gpu_scope_ms(2) == 1.0f);
+    teardown();
+}
+
+UTEST(sokol_gfx_gl, timing_ring_overflow_drops) {
+    setup();
+    // hold every sample in flight, then overfill the depth-4 ring
+    gl_mock_set_query_available(false);
+    sg_set_gpu_timing_enabled(true);
+    for (int i = 0; i < 5; i++) {
+        sg_gpu_timing_scope_begin(0);
+        sg_gpu_timing_scope_end(0);
+    }
+    // the fifth sample is dropped whole, never stalls, never truncates
+    T(gl_mock_count_calls(GL_MOCK_FUNC_glBeginQuery) == 4);
+    gl_mock_set_query_available(true);
+    T(sg_query_gpu_scope_ms(0) == 1.0f);
+    T(sg_query_gpu_scope_frame_index(0) == 1);
+    teardown();
+}
+
+UTEST(sokol_gfx_gl, timing_unbalanced_brackets) {
+    setup();
+    sg_set_gpu_timing_enabled(true);
+    // opening a second scope closes the first; stray ends are no-ops
+    sg_gpu_timing_scope_begin(0);
+    sg_gpu_timing_scope_begin(1);
+    sg_gpu_timing_scope_end(1);
+    sg_gpu_timing_scope_end(1);
+    sg_gpu_timing_scope_end(5);
+    T(sg_query_gpu_scope_ms(0) == 1.0f);
+    T(sg_query_gpu_scope_ms(1) == 1.0f);
+    // mid-scope disable ends the GL query before deleting it
+    sg_gpu_timing_scope_begin(2);
+    sg_set_gpu_timing_enabled(false);
+    T(sg_query_gpu_scope_ms(2) < 0.0f);
+    T(gl_mock_count_calls(GL_MOCK_FUNC_glEndQuery) > 0);
+    teardown();
+}
+
+UTEST(sokol_gfx_gl, timing_shutdown_reseal) {
+    setup();
+    sg_set_gpu_timing_enabled(true);
+    sg_gpu_timing_scope_begin(0);
+    sg_gpu_timing_scope_end(0);
+    T(sg_query_gpu_scope_ms(0) == 1.0f);
+    // shutdown tears down, a new setup starts clean and off
+    teardown();
+    setup();
+    T(sg_query_gpu_scope_ms(0) < 0.0f);
+    T(sg_query_gpu_frame_ms() < 0.0f);
+    T(sg_gpu_frame_timing_supported());
+    T(gl_mock_count_calls(GL_MOCK_FUNC_glBeginQuery) == 0);
+    teardown();
+}
+#endif
+
+#if !defined(SOKOL_GLCORE)
+UTEST(sokol_gfx_gl, timing_unsupported_backend) {
+    // timer queries exist on GLCORE-non-Win32 only: everything fails closed
+    setup();
+    sg_set_gpu_timing_enabled(true);
+    T(!sg_gpu_frame_timing_supported());
+    T(!sg_gpu_scope_timing_supported());
+    sg_gpu_timing_scope_begin(0);
+    sg_gpu_timing_scope_end(0);
+    T(sg_query_gpu_frame_ms() < 0.0f);
+    T(sg_query_gpu_scope_ms(0) < 0.0f);
+    T(sg_query_gpu_frame_index() == 0);
+    T(sg_query_gpu_scope_frame_index(0) == 0);
+    T(gl_mock_count_calls(GL_MOCK_FUNC_glBeginQuery) == 0);
+    teardown();
+}
+#endif
+
+//------------------------------------------------------------------------------
+ //  no-leaks full lifecycle
 //------------------------------------------------------------------------------
 UTEST(sokol_gfx_gl, no_leaks_full_lifecycle) {
     setup();

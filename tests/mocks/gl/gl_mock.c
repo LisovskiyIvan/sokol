@@ -141,6 +141,11 @@ typedef struct {
     int fail_uniform_loc;
     GLenum framebuffer_status;
     char info_log[GL_MOCK_MAX_INFO_LOG];
+
+    // timer queries (dedicated id space, not part of object tracking)
+    GLuint query_active;
+    bool query_available;
+    GLuint64 query_ns;
 } _glm_state_t;
 
 static _glm_state_t _glm;
@@ -403,6 +408,8 @@ void gl_mock_setup(void) {
     _glm.valid = true;
     _glm.bindings.active_texture = GL_TEXTURE0;
     _glm.framebuffer_status = GL_FRAMEBUFFER_COMPLETE;
+    _glm.query_available = true;
+    _glm.query_ns = 1000000;
     strcpy(_glm.info_log, "gl_mock info log");
 
     // initial render state as defined by the GL spec
@@ -691,6 +698,72 @@ const GLubyte* glGetStringi(GLenum name, GLuint index) {
         return (const GLubyte*) _glm_ext_table[index];
     }
     return 0;
+}
+
+//-- timer queries -------------------------------------------------------------
+// Scripted results for GL_TIME_ELAPSED pools: availability and nanoseconds
+// are global (default: available with 1 ms), tests steer them to cover
+// not-ready, zero-time and overflow paths.
+void glGenQueries(GLsizei n, GLuint* ids) {
+    _GLM_REC(glGenQueries, _glm_ai(n), _glm_ap(ids));
+    assert(ids);
+    static GLuint next_id = 1;
+    for (GLsizei i = 0; i < n; i++) {
+        ids[i] = next_id++;
+    }
+}
+
+void glDeleteQueries(GLsizei n, const GLuint* ids) {
+    _GLM_REC(glDeleteQueries, _glm_ai(n), _glm_ap(ids));
+    assert(ids);
+    if (_glm.query_active != 0) {
+        for (GLsizei i = 0; i < n; i++) {
+            if (ids[i] == _glm.query_active) {
+                _glm.query_active = 0;
+            }
+        }
+    }
+}
+
+void glBeginQuery(GLenum target, GLuint id) {
+    _GLM_REC(glBeginQuery, _glm_ai(target), _glm_ai(id));
+    assert(target == GL_TIME_ELAPSED);
+    assert(id != 0);
+    assert(_glm.query_active == 0);
+    _glm.query_active = id;
+}
+
+void glEndQuery(GLenum target) {
+    _GLM_REC(glEndQuery, _glm_ai(target));
+    assert(target == GL_TIME_ELAPSED);
+    assert(_glm.query_active != 0);
+    _glm.query_active = 0;
+}
+
+void glGetQueryObjectuiv(GLuint id, GLenum pname, GLuint* params) {
+    // not logged, this is a pure query
+    assert(id != 0);
+    assert(pname == GL_QUERY_RESULT_AVAILABLE);
+    assert(params);
+    _GLM_UNUSED(id);
+    *params = _glm.query_available ? 1 : 0;
+}
+
+void glGetQueryObjectui64v(GLuint id, GLenum pname, GLuint64* params) {
+    // not logged, this is a pure query
+    assert(id != 0);
+    assert(pname == GL_QUERY_RESULT);
+    assert(params);
+    _GLM_UNUSED(id);
+    *params = _glm.query_ns;
+}
+
+void gl_mock_set_query_available(bool available) {
+    _glm.query_available = available;
+}
+
+void gl_mock_set_query_ns(uint64_t ns) {
+    _glm.query_ns = (GLuint64)ns;
 }
 
 //-- buffers -------------------------------------------------------------------

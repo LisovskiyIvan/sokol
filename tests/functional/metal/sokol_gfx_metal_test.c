@@ -2082,6 +2082,459 @@ UTEST(sokol_gfx_metal, debug_groups) {
     discard_swapchain(&sc);
 }
 
+//== GPU timings ==========================================================
+static void timed_compute_frame(void) {
+    sg_begin_pass(&(sg_pass){ .compute = true });
+    sg_end_pass();
+    sg_commit();
+}
+
+UTEST(sokol_gfx_metal, timing_no_context) {
+    // fail-closed without an sg context: no-ops, -1, false, 0, no crash
+    sg_set_gpu_timing_enabled(true);
+    T(!sg_gpu_frame_timing_supported());
+    T(!sg_gpu_scope_timing_supported());
+    T(sg_query_gpu_frame_ms() < 0.0f);
+    T(sg_query_gpu_scope_ms(0) < 0.0f);
+    T(sg_query_gpu_frame_index() == 0);
+    T(sg_query_gpu_scope_frame_index(0) == 0);
+    sg_gpu_timing_scope_begin(0);
+    sg_gpu_timing_scope_end(0);
+}
+
+UTEST(sokol_gfx_metal, timing_default_off) {
+    setup();
+    // caps ignore the enabled intent, queries stay fail-closed
+    T(sg_gpu_frame_timing_supported());
+    T(sg_gpu_scope_timing_supported());
+    T(sg_query_gpu_frame_ms() < 0.0f);
+    T(sg_query_gpu_scope_ms(1) < 0.0f);
+    T(sg_query_gpu_frame_index() == 0);
+    T(sg_query_gpu_scope_frame_index(1) == 0);
+    T(sg_query_gpu_scope_ms(-1) < 0.0f);
+    T(sg_query_gpu_scope_ms(16) < 0.0f);
+    T(sg_query_gpu_scope_frame_index(16) == 0);
+    // disabled path allocates nothing and encodes no timestamps
+    timed_compute_frame();
+    T(metal_mock_count_calls(METAL_MOCK_FUNC_newCounterSampleBufferWithDescriptor) == 0);
+    T(metal_mock_count_calls(METAL_MOCK_FUNC_computeCommandEncoderWithDescriptor) == 0);
+    teardown();
+}
+
+UTEST(sokol_gfx_metal, timing_frame_completed) {
+    setup();
+    sg_set_gpu_timing_enabled(true);
+    timed_compute_frame();  // frame 1
+    // not ready before the GPU finishes: fail-closed, never waits
+    T(sg_query_gpu_frame_ms() < 0.0f);
+    T(sg_query_gpu_frame_index() == 0);
+    metal_mock_set_command_buffer_times(metal_mock_last_command_buffer(), 1.0, 1.0025);
+    const float ms0 = sg_query_gpu_frame_ms();
+    T((ms0 > 2.49f) && (ms0 < 2.51f));
+    T(sg_query_gpu_frame_index() == 1);
+    // a newer completed frame wins
+    timed_compute_frame();  // frame 2
+    metal_mock_set_command_buffer_times(metal_mock_last_command_buffer(), 2.0, 2.01);
+    const float ms1 = sg_query_gpu_frame_ms();
+    T((ms1 > 9.9f) && (ms1 < 10.1f));
+    T(sg_query_gpu_frame_index() == 2);
+    teardown();
+}
+
+UTEST(sokol_gfx_metal, timing_frame_error_status) {
+    setup();
+    sg_set_gpu_timing_enabled(true);
+    timed_compute_frame();
+    metal_mock_set_command_buffer_status(metal_mock_last_command_buffer(), (int)MTLCommandBufferStatusError);
+    T(sg_query_gpu_frame_ms() < 0.0f);
+    T(sg_query_gpu_frame_index() == 0);
+    teardown();
+}
+
+UTEST(sokol_gfx_metal, timing_scope_counters) {
+    setup();
+    swapchain_t sc = make_swapchain(64, 32, 1, false);
+    // render native 0 owns counters 0..3 (vertex start/end, fragment start/end)
+    metal_mock_set_counter_timestamp(0, 1000);
+    metal_mock_set_counter_timestamp(1, 3000);
+    metal_mock_set_counter_timestamp(2, 2000);
+    metal_mock_set_counter_timestamp(3, 7000);
+    sg_set_gpu_timing_enabled(true);
+    sg_gpu_timing_scope_begin(1);
+    sg_begin_pass(&(sg_pass){ .swapchain = swapchain(&sc) });
+    sg_end_pass();
+    sg_gpu_timing_scope_end(1);
+    sg_commit();  // frame 1
+    // indices preassigned at encoder creation, not patched afterwards
+    const metal_mock_render_pass_info_t* pass = metal_mock_last_render_pass();
+    T(pass->has_sample_buffer);
+    T(pass->start_vertex_index == 0);
+    T(pass->end_vertex_index == 1);
+    T(pass->start_fragment_index == 2);
+    T(pass->end_fragment_index == 3);
+    T(metal_mock_count_calls(METAL_MOCK_FUNC_newCounterSampleBufferWithDescriptor) == 1);
+    T(sg_query_gpu_scope_ms(1) < 0.0f);
+    metal_mock_set_command_buffer_times(metal_mock_last_command_buffer(), 1.0, 1.01);
+    // start=min(1000,2000), end=max(3000,7000): 6000 ns = 0.006 ms
+    const float pms = sg_query_gpu_scope_ms(1);
+    T((pms > 0.0059f) && (pms < 0.0061f));
+    T(sg_query_gpu_scope_frame_index(1) == 1);
+    T(sg_query_gpu_scope_ms(0) < 0.0f);
+    T(sg_query_gpu_scope_ms(2) < 0.0f);
+    // frame timer still serves the full buffer span
+    const float fms = sg_query_gpu_frame_ms();
+    T((fms > 9.9f) && (fms < 10.1f));
+    T(sg_query_gpu_frame_index() == 1);
+    teardown();
+    discard_swapchain(&sc);
+}
+
+UTEST(sokol_gfx_metal, timing_scope_multi_native_aggregate) {
+    setup();
+    swapchain_t sc = make_swapchain(64, 32, 1, false);
+    // compute native 0 owns counters 0..1, render native 1 owns 4..7
+    metal_mock_set_counter_timestamp(0, 1000);
+    metal_mock_set_counter_timestamp(1, 3000);
+    metal_mock_set_counter_timestamp(4, 4000);
+    metal_mock_set_counter_timestamp(5, 5000);
+    metal_mock_set_counter_timestamp(6, 4500);
+    metal_mock_set_counter_timestamp(7, 9000);
+    sg_set_gpu_timing_enabled(true);
+    sg_gpu_timing_scope_begin(0);
+    sg_begin_pass(&(sg_pass){ .compute = true });
+    sg_end_pass();
+    sg_begin_pass(&(sg_pass){ .swapchain = swapchain(&sc) });
+    sg_end_pass();
+    sg_gpu_timing_scope_end(0);
+    sg_commit();
+    const metal_mock_compute_encoder_state_t* cstate = metal_mock_compute_encoder_state();
+    T(cstate->from_descriptor);
+    T(cstate->has_sample_buffer);
+    T(cstate->start_encoder_index == 0);
+    T(cstate->end_encoder_index == 1);
+    const metal_mock_render_pass_info_t* rpass = metal_mock_last_render_pass();
+    T(rpass->has_sample_buffer);
+    T(rpass->start_vertex_index == 4);
+    T(rpass->end_fragment_index == 7);
+    metal_mock_set_command_buffer_times(metal_mock_last_command_buffer(), 0.0, 0.02);
+    // FIRST start (1000) to LAST end (9000): 8000 ns = 0.008 ms
+    const float pms = sg_query_gpu_scope_ms(0);
+    T((pms > 0.0079f) && (pms < 0.0081f));
+    T(sg_query_gpu_scope_frame_index(0) == 1);
+    teardown();
+    discard_swapchain(&sc);
+}
+
+UTEST(sokol_gfx_metal, timing_scope_unsupported) {
+    setup();
+    metal_mock_set_counter_sampling_supported(false);
+    T(sg_gpu_frame_timing_supported());
+    T(!sg_gpu_scope_timing_supported());
+    swapchain_t sc = make_swapchain(64, 32, 1, false);
+    sg_set_gpu_timing_enabled(true);
+    sg_gpu_timing_scope_begin(1);
+    sg_begin_pass(&(sg_pass){ .swapchain = swapchain(&sc) });
+    sg_end_pass();
+    sg_gpu_timing_scope_end(1);
+    sg_commit();
+    // no counters attached, scopes fail closed...
+    T(!metal_mock_last_render_pass()->has_sample_buffer);
+    T(sg_query_gpu_scope_ms(1) < 0.0f);
+    T(sg_query_gpu_scope_frame_index(1) == 0);
+    // ...while the full-buffer frame timer needs no counters
+    metal_mock_set_command_buffer_times(metal_mock_last_command_buffer(), 0.0, 0.005);
+    const float fms = sg_query_gpu_frame_ms();
+    T((fms > 4.9f) && (fms < 5.1f));
+    teardown();
+    discard_swapchain(&sc);
+}
+
+UTEST(sokol_gfx_metal, timing_scope_error_value) {
+    setup();
+    swapchain_t sc = make_swapchain(64, 32, 1, false);
+    metal_mock_set_counter_timestamp(0, 1000);
+    metal_mock_set_counter_timestamp(1, MTLCounterErrorValue);
+    metal_mock_set_counter_timestamp(2, 2000);
+    metal_mock_set_counter_timestamp(3, 3000);
+    sg_set_gpu_timing_enabled(true);
+    sg_gpu_timing_scope_begin(2);
+    sg_begin_pass(&(sg_pass){ .swapchain = swapchain(&sc) });
+    sg_end_pass();
+    sg_gpu_timing_scope_end(2);
+    sg_commit();
+    metal_mock_set_command_buffer_times(metal_mock_last_command_buffer(), 1.0, 1.01);
+    // error value invalidates the scope sample, not the frame sample
+    T(sg_query_gpu_scope_ms(2) < 0.0f);
+    T(sg_query_gpu_scope_frame_index(2) == 0);
+    T(sg_query_gpu_frame_ms() > 9.9f);
+    teardown();
+    discard_swapchain(&sc);
+}
+
+UTEST(sokol_gfx_metal, timing_toggle) {
+    setup();
+    sg_set_gpu_timing_enabled(true);
+    sg_set_gpu_timing_enabled(true);  // idempotent repeat
+    timed_compute_frame();
+    T(metal_mock_count_calls(METAL_MOCK_FUNC_newCounterSampleBufferWithDescriptor) == 1);
+    metal_mock_set_command_buffer_times(metal_mock_last_command_buffer(), 0.0, 0.001);
+    T(sg_query_gpu_frame_ms() > 0.9f);
+    sg_set_gpu_timing_enabled(false);
+    T(sg_query_gpu_frame_ms() < 0.0f);
+    T(sg_query_gpu_scope_ms(1) < 0.0f);
+    T(sg_query_gpu_frame_index() == 0);
+    // the dead pass descriptor still retains the buffer until pool drain
+    metal_mock_drain_pool();
+    T(metal_mock_live_objects(METAL_MOCK_OBJ_COUNTER_SAMPLE_BUFFER) == 0);
+    // re-enable serves new samples
+    sg_set_gpu_timing_enabled(true);
+    timed_compute_frame();
+    metal_mock_set_command_buffer_times(metal_mock_last_command_buffer(), 0.0, 0.002);
+    const float ms = sg_query_gpu_frame_ms();
+    T((ms > 1.9f) && (ms < 2.1f));
+    teardown();
+}
+
+UTEST(sokol_gfx_metal, timing_frame_ms_index_pairing) {
+    // the frame index getter reports the tag of the LAST frame ms query
+    // verbatim and never resolves: a buffer completing between the paired
+    // calls must not retag the already-served ms value
+    setup();
+    sg_set_gpu_timing_enabled(true);
+    timed_compute_frame();  // frame 1
+    const void* cb1 = metal_mock_last_command_buffer();
+    timed_compute_frame();  // frame 2, GPU slow (both Committed)
+    // only frame 1 completes: positive ms with its tag
+    metal_mock_set_command_buffer_times(cb1, 1.0, 1.0025);
+    const float ms0 = sg_query_gpu_frame_ms();
+    T((ms0 > 2.49f) && (ms0 < 2.51f));
+    T(sg_query_gpu_frame_index() == 1);
+    // frame 2 completes between the paired calls: index stays old
+    metal_mock_set_command_buffer_times(metal_mock_last_command_buffer(), 2.0, 2.01);
+    T(sg_query_gpu_frame_index() == 1);
+    // the next ms query picks up frame 2 with its own tag
+    const float ms1 = sg_query_gpu_frame_ms();
+    T((ms1 > 9.9f) && (ms1 < 10.1f));
+    T(sg_query_gpu_frame_index() == 2);
+    teardown();
+}
+
+UTEST(sokol_gfx_metal, timing_scope_ms_index_pairing) {
+    // same pairing rule for the scope getters
+    setup();
+    swapchain_t sc = make_swapchain(64, 32, 1, false);
+    metal_mock_set_counter_timestamp(0, 1000);
+    metal_mock_set_counter_timestamp(1, 3000);
+    metal_mock_set_counter_timestamp(2, 2000);
+    metal_mock_set_counter_timestamp(3, 7000);
+    sg_set_gpu_timing_enabled(true);
+    sg_gpu_timing_scope_begin(1);
+    sg_begin_pass(&(sg_pass){ .swapchain = swapchain(&sc) });
+    sg_end_pass();
+    sg_gpu_timing_scope_end(1);
+    sg_commit();  // frame 1
+    const void* cb1 = metal_mock_last_command_buffer();
+    sg_gpu_timing_scope_begin(1);
+    sg_begin_pass(&(sg_pass){ .swapchain = swapchain(&sc) });
+    sg_end_pass();
+    sg_gpu_timing_scope_end(1);
+    sg_commit();  // frame 2, GPU slow
+    // only frame 1 completes: positive ms (6000 ns) with its tag
+    metal_mock_set_command_buffer_times(cb1, 1.0, 1.01);
+    const float pms0 = sg_query_gpu_scope_ms(1);
+    T((pms0 > 0.0059f) && (pms0 < 0.0061f));
+    T(sg_query_gpu_scope_frame_index(1) == 1);
+    // frame 2 completes between the paired calls: index stays old
+    metal_mock_set_command_buffer_times(metal_mock_last_command_buffer(), 2.0, 2.02);
+    T(sg_query_gpu_scope_frame_index(1) == 1);
+    T(sg_query_gpu_scope_ms(1) > 0.0059f);
+    T(sg_query_gpu_scope_frame_index(1) == 2);
+    teardown();
+    discard_swapchain(&sc);
+}
+
+UTEST(sokol_gfx_metal, timing_scope_empty_bracket) {
+    // a bracket with no native passes measures nothing: -1, never 0
+    setup();
+    sg_set_gpu_timing_enabled(true);
+    sg_gpu_timing_scope_begin(0);
+    sg_begin_pass(&(sg_pass){ .compute = true });
+    sg_end_pass();
+    sg_gpu_timing_scope_end(0);
+    sg_gpu_timing_scope_begin(1);
+    sg_gpu_timing_scope_end(1);
+    sg_commit();  // single frame 1
+    metal_mock_set_command_buffer_times(metal_mock_last_command_buffer(), 1.0, 1.01);
+    T(sg_query_gpu_scope_ms(0) > 0.0f);
+    T(sg_query_gpu_scope_frame_index(0) == 1);
+    T(sg_query_gpu_scope_ms(1) < 0.0f);
+    T(sg_query_gpu_scope_frame_index(1) == 0);
+    T(sg_query_gpu_frame_ms() > 9.9f);
+    teardown();
+}
+
+UTEST(sokol_gfx_metal, timing_scope_resolve_nil) {
+    // unresolvable counters invalidate the scope, not the frame
+    setup();
+    swapchain_t sc = make_swapchain(64, 32, 1, false);
+    metal_mock_set_counter_resolve_nil(true);
+    sg_set_gpu_timing_enabled(true);
+    sg_gpu_timing_scope_begin(1);
+    sg_begin_pass(&(sg_pass){ .swapchain = swapchain(&sc) });
+    sg_end_pass();
+    sg_gpu_timing_scope_end(1);
+    sg_commit();
+    metal_mock_set_command_buffer_times(metal_mock_last_command_buffer(), 1.0, 1.01);
+    T(sg_query_gpu_scope_ms(1) < 0.0f);
+    T(sg_query_gpu_scope_frame_index(1) == 0);
+    T(sg_query_gpu_frame_ms() > 9.9f);
+    T(sg_query_gpu_frame_index() == 1);
+    teardown();
+    discard_swapchain(&sc);
+}
+
+UTEST(sokol_gfx_metal, timing_native_overflow) {
+    // more than 128 timestamped natives: whole counter sample drops,
+    // frame timer unaffected
+    setup();
+    sg_set_gpu_timing_enabled(true);
+    sg_gpu_timing_scope_begin(0);
+    for (int i = 0; i < 129; i++) {
+        sg_begin_pass(&(sg_pass){ .compute = true });
+        sg_end_pass();
+    }
+    sg_gpu_timing_scope_end(0);
+    sg_commit();
+    // 128 descriptor encoders, the 129th falls back unstamped
+    T(metal_mock_count_calls(METAL_MOCK_FUNC_computeCommandEncoderWithDescriptor) == 128);
+    T(metal_mock_count_calls(METAL_MOCK_FUNC_computeCommandEncoder) == 1);
+    metal_mock_set_command_buffer_times(metal_mock_last_command_buffer(), 1.0, 1.01);
+    T(sg_query_gpu_scope_ms(0) < 0.0f);
+    T(sg_query_gpu_scope_frame_index(0) == 0);
+    T(sg_query_gpu_frame_ms() > 9.9f);
+    teardown();
+}
+
+UTEST(sokol_gfx_metal, timing_ring_saturation_no_leak) {
+    // slow GPU: all 4 ring slots fill with uncompleted buffers, further
+    // frames evict (drop whole) via the deferred release queue; shutdown
+    // and re-setup retain no timer objects
+    setup();
+    sg_set_gpu_timing_enabled(true);
+    for (int i = 0; i < 6; i++) {
+        timed_compute_frame();
+    }
+    T(sg_query_gpu_frame_ms() < 0.0f);
+    T(sg_query_gpu_frame_index() == 0);
+    T(sg_query_gpu_scope_ms(0) < 0.0f);
+    sg_set_gpu_timing_enabled(false);
+    metal_mock_complete_pending();
+    sg_shutdown();
+    metal_mock_drain_pool();
+    T(metal_mock_live_objects(METAL_MOCK_OBJ_COUNTER_SAMPLE_BUFFER) == 0);
+    T(metal_mock_live_objects(METAL_MOCK_OBJ_COMMAND_BUFFER) == 0);
+    metal_mock_shutdown();
+    setup();
+    T(sg_query_gpu_frame_ms() < 0.0f);
+    T(sg_gpu_frame_timing_supported());
+    T(sg_gpu_scope_timing_supported());
+    teardown();
+}
+
+UTEST(sokol_gfx_metal, timing_counter_creation_failed) {
+    // sample-buffer creation failure fails the counters closed, frame ok
+    setup();
+    swapchain_t sc = make_swapchain(64, 32, 1, false);
+    metal_mock_fail_next(METAL_MOCK_OBJ_COUNTER_SAMPLE_BUFFER, 1);
+    sg_set_gpu_timing_enabled(true);
+    sg_gpu_timing_scope_begin(0);
+    sg_begin_pass(&(sg_pass){ .swapchain = swapchain(&sc) });
+    sg_end_pass();
+    sg_gpu_timing_scope_end(0);
+    sg_commit();
+    T(metal_mock_count_calls(METAL_MOCK_FUNC_newCounterSampleBufferWithDescriptor) == 1);
+    metal_mock_set_command_buffer_times(metal_mock_last_command_buffer(), 1.0, 1.01);
+    T(sg_query_gpu_scope_ms(0) < 0.0f);
+    T(sg_query_gpu_frame_ms() > 9.9f);
+    teardown();
+    discard_swapchain(&sc);
+}
+
+UTEST(sokol_gfx_metal, timing_compute_encoder_failed) {
+    // stamped but unencodable compute pass: counters invalid whole, frame ok
+    setup();
+    metal_mock_fail_next(METAL_MOCK_OBJ_COMPUTE_ENCODER, 1);
+    sg_set_gpu_timing_enabled(true);
+    sg_gpu_timing_scope_begin(0);
+    sg_begin_pass(&(sg_pass){ .compute = true });
+    T(sg_mtl_compute_command_encoder() == 0);
+    sg_end_pass();
+    sg_gpu_timing_scope_end(0);
+    sg_commit();
+    metal_mock_set_command_buffer_times(metal_mock_last_command_buffer(), 1.0, 1.01);
+    T(sg_query_gpu_scope_ms(0) < 0.0f);
+    T(sg_query_gpu_frame_ms() > 9.9f);
+    teardown();
+}
+
+UTEST(sokol_gfx_metal, timing_scope_high_ids) {
+    // scopes are caller-defined ids in [0, SG_MAX_GPU_TIMING_SCOPES):
+    // high ids aggregate per-scope ranges exactly like low ones
+    setup();
+    swapchain_t sc = make_swapchain(64, 32, 1, false);
+    // compute native 0 owns counters 0..1, render native 1 owns 4..7
+    metal_mock_set_counter_timestamp(0, 1000);
+    metal_mock_set_counter_timestamp(1, 5000);
+    metal_mock_set_counter_timestamp(4, 2000);
+    metal_mock_set_counter_timestamp(5, 3000);
+    metal_mock_set_counter_timestamp(6, 2500);
+    metal_mock_set_counter_timestamp(7, 8000);
+    sg_set_gpu_timing_enabled(true);
+    sg_gpu_timing_scope_begin(7);
+    sg_begin_pass(&(sg_pass){ .compute = true });
+    sg_end_pass();
+    sg_gpu_timing_scope_end(7);
+    sg_gpu_timing_scope_begin(15);
+    sg_begin_pass(&(sg_pass){ .swapchain = swapchain(&sc) });
+    sg_end_pass();
+    sg_gpu_timing_scope_end(15);
+    sg_commit();
+    metal_mock_set_command_buffer_times(metal_mock_last_command_buffer(), 1.0, 1.02);
+    // scope 7: 1000..5000 = 4000 ns
+    const float ms7 = sg_query_gpu_scope_ms(7);
+    T((ms7 > 0.0039f) && (ms7 < 0.0041f));
+    T(sg_query_gpu_scope_frame_index(7) == 1);
+    // scope 15: start=min(2000,2500), end=max(3000,8000) = 6000 ns
+    const float ms15 = sg_query_gpu_scope_ms(15);
+    T((ms15 > 0.0059f) && (ms15 < 0.0061f));
+    T(sg_query_gpu_scope_frame_index(15) == 1);
+    // low scopes untouched, boundary ids fail closed
+    T(sg_query_gpu_scope_ms(0) < 0.0f);
+    T(sg_query_gpu_scope_ms(16) < 0.0f);
+    T(sg_query_gpu_scope_frame_index(16) == 0);
+    teardown();
+    discard_swapchain(&sc);
+}
+
+UTEST(sokol_gfx_metal, timing_shutdown_reseal) {
+    setup();
+    sg_set_gpu_timing_enabled(true);
+    timed_compute_frame();
+    metal_mock_set_command_buffer_times(metal_mock_last_command_buffer(), 1.0, 1.001);
+    T(sg_query_gpu_frame_ms() > 0.9f);
+    // shutdown tears down, a new setup starts clean and off
+    metal_mock_complete_pending();
+    sg_shutdown();
+    metal_mock_drain_pool();
+    metal_mock_shutdown();
+    setup();
+    T(sg_query_gpu_frame_ms() < 0.0f);
+    T(sg_query_gpu_frame_index() == 0);
+    T(sg_gpu_frame_timing_supported());
+    T(metal_mock_live_objects(METAL_MOCK_OBJ_COUNTER_SAMPLE_BUFFER) == 0);
+    teardown();
+}
+
 //== leak check ================================================================
 UTEST(sokol_gfx_metal, no_leaks_full_lifecycle) {
     setup();

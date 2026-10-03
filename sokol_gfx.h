@@ -2188,6 +2188,7 @@ enum {
     SG_MAX_PORTABLE_TEXTURE_BINDINGS_PER_STAGE = 16,
     SG_MAX_PORTABLE_STORAGEBUFFER_BINDINGS_PER_STAGE = 8,   // assuming sg_features.compute = true
     SG_MAX_PORTABLE_STORAGEIMAGE_BINDINGS_PER_STAGE = 4,    // assuming sg_features.compute = true
+    SG_MAX_GPU_TIMING_SCOPES = 16,  // caller-defined GPU timing scope ids are [0..16)
 };
 
 /*
@@ -5525,30 +5526,43 @@ SOKOL_GFX_API_DECL void sg_draw_ex(int base_element, int num_elements, int num_i
 SOKOL_GFX_API_DECL void sg_dispatch(int num_groups_x, int num_groups_y, int num_groups_z);
 SOKOL_GFX_API_DECL void sg_end_pass(void);
 SOKOL_GFX_API_DECL void sg_commit(void);
-// AGATE GPU TIMINGS (agate fork patch):
-// frame-level GPU execution time for the Metal backend, off by default.
-// sg_agate_set_gpu_timing_enabled(true) retains each committed command
-// buffer; sg_agate_query_gpu_frame_ms() returns the last COMPLETED frame's
-// (GPUEndTime-GPUStartTime) in ms, or -1 when unavailable/not ready yet.
-// Non-Metal backends always return -1. Trace hooks (SOKOL_TRACE_HOOKS) are
-// unrelated: they are CPU-side begin/end callbacks, not GPU timestamps.
-SOKOL_GFX_API_DECL void sg_agate_set_gpu_timing_enabled(bool enabled);
-SOKOL_GFX_API_DECL float sg_agate_query_gpu_frame_ms(void);
-// AGATE GPU TIMINGS v2 (per-pass timers):
-// engine-driven phase timers. Pass ids: 0=shadow, 1=main, 2=post.
-// The engine brackets each phase with pass_begin/end; query returns the
-// last COMPLETED sample in ms, or -1 when unavailable (disabled, not
-// ready yet, Metal/unsupported backend, or an invalid pass id).
-SOKOL_GFX_API_DECL void sg_agate_gpu_pass_begin(int pass);
-SOKOL_GFX_API_DECL void sg_agate_gpu_pass_end(int pass);
-SOKOL_GFX_API_DECL float sg_agate_query_gpu_pass_ms(int pass);
-// File-static helpers owned by the v2 GL-state block below (real pool on
-// GLCORE-non-Win32, no-op stubs elsewhere, bottom stubs when the GL
-// region itself is compiled out). Forward-declared here with plain
-// `static` (`_SOKOL_PRIVATE` is only defined further down) so the
-// backend-independent `sg_agate_set_gpu_timing_enabled` below can mirror
-// into the pool on every backend without an implicit declaration.
-static void _sg_agate_gl_apply_enabled(bool enabled);
+// GPU TIMINGS:
+// Opt-in GPU execution-time queries, off by default (no timing objects
+// exist until enabled). Scopes are caller-defined numbered groups of one
+// or more real native render/compute passes (not sokol sg_begin_pass
+// itself); ids are [0, SG_MAX_GPU_TIMING_SCOPES). Boundary pairs are
+// sequential and non-nested. Backend scope differs, see each query:
+// Metal frame = full command-buffer span (GPUStartTime/GPUEndTime),
+// Metal scopes = counter-aggregated first-start to last-end per scope,
+// WGPU frame = first to last native-pass timestamp span,
+// WGPU scopes = same aggregation per scope,
+// GL frame = sum of last-completed per-scope TIME_ELAPSED values,
+// GL scopes = last-completed TIME_ELAPSED per scope.
+// Timestamps aggregate FIRST start to LAST end per scope. Completed
+// samples carry the submission _sg.frame_index; frame queries never mix
+// samples from different frames. Queries return -1 (0 for the index
+// queries) when disabled, invalid, unsupported or not ready yet; a valid
+// 0 ms sample is a real result. Trace hooks are unrelated CPU callbacks,
+// not GPU timestamps.
+// Getter pairing: each ms query refreshes exactly once and publishes its
+// (ms, index) pair; each index getter returns the tag of the LAST ms
+// query verbatim and never polls the GPU itself, so a paired ms/index
+// call set can't straddle an async completion. Query ms first, then read
+// its index. A scope bracket with no native passes inside measures
+// nothing: Metal/WGPU report -1 (never a fabricated 0), while a GL
+// bracket always issues a real query (which may read a valid 0).
+// WGPU callbacks run on the host event pump, never interleaved inside a
+// synchronous C call pair: keep pumps on the context thread and don't
+// pump between a paired ms/index call set.
+SOKOL_GFX_API_DECL void sg_set_gpu_timing_enabled(bool enabled);
+SOKOL_GFX_API_DECL bool sg_gpu_frame_timing_supported(void);
+SOKOL_GFX_API_DECL bool sg_gpu_scope_timing_supported(void);
+SOKOL_GFX_API_DECL void sg_gpu_timing_scope_begin(int scope);
+SOKOL_GFX_API_DECL void sg_gpu_timing_scope_end(int scope);
+SOKOL_GFX_API_DECL float sg_query_gpu_frame_ms(void);
+SOKOL_GFX_API_DECL float sg_query_gpu_scope_ms(int scope);
+SOKOL_GFX_API_DECL uint32_t sg_query_gpu_frame_index(void);
+SOKOL_GFX_API_DECL uint32_t sg_query_gpu_scope_frame_index(int scope);
 
 // resource update functions (wip new resource update api)
 SOKOL_GFX_API_DECL void sg_write_buffer_transient(const sg_write_buffer_desc* desc);
@@ -11121,9 +11135,14 @@ _SOKOL_PRIVATE void _sg_gl_reset_state_cache(void) {
         _sg_stats_add(gl.num_render_state, 2);
     #endif
 }
+// GPU TIMINGS helpers, owned by the timing block further below.
+_SOKOL_PRIVATE void _sg_gpu_timing_gl_reset(void);
+_SOKOL_PRIVATE void _sg_gpu_timing_gl_teardown(void);
 
 _SOKOL_PRIVATE void _sg_gl_setup_backend(const sg_desc* desc) {
     _SOKOL_UNUSED(desc);
+    // GPU TIMINGS: fresh context starts with timings off, no objects.
+    _sg_gpu_timing_gl_reset();
 
     // assumes that _sg.gl is already zero-initialized
     _sg.gl.valid = true;
@@ -11161,6 +11180,8 @@ _SOKOL_PRIVATE void _sg_gl_setup_backend(const sg_desc* desc) {
 
 _SOKOL_PRIVATE void _sg_gl_discard_backend(void) {
     SOKOL_ASSERT(_sg.gl.valid);
+    // GPU TIMINGS: delete live queries while the context is alive
+    _sg_gpu_timing_gl_teardown();
     if (_sg.gl.fb) {
         glDeleteFramebuffers(1, &_sg.gl.fb);
     }
@@ -12818,12 +12839,15 @@ _SOKOL_PRIVATE void _sg_gl_dispatch(int num_groups_x, int num_groups_y, int num_
     #endif
 }
 
-// AGATE GPU TIMINGS v2 (per-pass GL timer queries):
-// engine-driven GL_TIME_ELAPSED pools, one per pass (0=shadow, 1=main,
-// 2=post). Context thread only (phase brackets + commit drain + query
-// poll all run there), so no atomics. Queries retire with a KEEP-frame
+// GPU TIMINGS (GL timer queries):
+// GL_TIME_ELAPSED pools, one per caller-defined scope. Context thread
+// only (scope brackets + commit drain + query poll all run there), so no
+// atomics. Queries retire with a KEEP-frame
 // lag and are reaped without stalling (GL_QUERY_RESULT_AVAILABLE);
-// the served value is always the last COMPLETED sample, like v1.
+// the served value is always the last COMPLETED sample. Each completed
+// sample is tagged with the submission _sg.frame_index; the frame query
+// sums per-scope values only when all sampled scopes share one frame tag
+// (GL scope-sum frame, inter-pass bubbles excluded), else -1.
 #if defined(SOKOL_GLCORE) && !defined(_WIN32)
 // <GL/gl.h> on Linux stops at GL 1.x: declare the timer-query entry
 // points used below (exported by libGL; macOS <OpenGL/gl3.h> already
@@ -12845,22 +12869,32 @@ extern void glGetQueryObjectui64v(GLuint id, GLenum pname, uint64_t* params);
 #ifndef GL_QUERY_RESULT_AVAILABLE
 #define GL_QUERY_RESULT_AVAILABLE 0x8867
 #endif
-#define _SG_AGATE_GPU_PASSES (3)
-#define _SG_AGATE_GPU_QUERY_DEPTH (4)
-static bool _sg_agate_gl_enabled = false;
-static GLuint _sg_agate_gl_queries[_SG_AGATE_GPU_PASSES][_SG_AGATE_GPU_QUERY_DEPTH] = { { 0 } };
-static uint8_t _sg_agate_gl_head[_SG_AGATE_GPU_PASSES] = { 0, 0, 0 };
-static uint8_t _sg_agate_gl_tail[_SG_AGATE_GPU_PASSES] = { 0, 0, 0 };
-static uint8_t _sg_agate_gl_pending[_SG_AGATE_GPU_PASSES] = { 0, 0, 0 };
-static int _sg_agate_gl_active = -1;
-static float _sg_agate_gl_last_ms[_SG_AGATE_GPU_PASSES] = { -1.0f, -1.0f, -1.0f };
+#define _SG_GPU_TIMING_QUERY_DEPTH (4)
+static bool _sg_gpu_timing_gl_enabled = false;
+static GLuint _sg_gpu_timing_gl_queries[SG_MAX_GPU_TIMING_SCOPES][_SG_GPU_TIMING_QUERY_DEPTH] = { { 0 } };
+static uint8_t _sg_gpu_timing_gl_head[SG_MAX_GPU_TIMING_SCOPES] = { 0 };
+static uint8_t _sg_gpu_timing_gl_tail[SG_MAX_GPU_TIMING_SCOPES] = { 0 };
+static uint8_t _sg_gpu_timing_gl_pending[SG_MAX_GPU_TIMING_SCOPES] = { 0 };
+static int _sg_gpu_timing_gl_active = -1;
+static float _sg_gpu_timing_gl_last_ms[SG_MAX_GPU_TIMING_SCOPES] = { 0 };
+// submission _sg.frame_index per ring slot, copied to last_frame on reap
+static uint32_t _sg_gpu_timing_gl_begin_frame[SG_MAX_GPU_TIMING_SCOPES][_SG_GPU_TIMING_QUERY_DEPTH] = { { 0 } };
+// frame tag of last completed sample per scope, 0 when no sample yet
+static uint32_t _sg_gpu_timing_gl_last_frame[SG_MAX_GPU_TIMING_SCOPES] = { 0 };
+// last PUBLISHED snapshot per scope/frame: written once by each ms query,
+// read verbatim by the index getters (which never reap, so a paired
+// ms/index call set can't straddle an async GPU completion)
+static float _sg_gpu_timing_gl_pub_ms[SG_MAX_GPU_TIMING_SCOPES] = { 0 };
+static uint32_t _sg_gpu_timing_gl_pub_frame[SG_MAX_GPU_TIMING_SCOPES] = { 0 };
+static float _sg_gpu_timing_gl_pub_fms = -1.0f;
+static uint32_t _sg_gpu_timing_gl_pub_fframe = 0;
 // Reap retired queries for pass p, oldest first, never stalling: only
-// AVAILABLE results are read (ns -> ms with a 10 s sanity clamp).
+// AVAILABLE results are read (ns -> ms, 0 allowed, 10 s sanity clamp).
 // Completion for a single target is in order, so the first not-ready
-// query stops the drain.
-_SOKOL_PRIVATE void _sg_agate_gl_reap(int p) {
-    while (_sg_agate_gl_pending[p] > 0) {
-        const GLuint q = _sg_agate_gl_queries[p][_sg_agate_gl_tail[p]];
+// query stops the drain. Each reaped sample takes its submission tag.
+_SOKOL_PRIVATE void _sg_gpu_timing_gl_reap(int p) {
+    while (_sg_gpu_timing_gl_pending[p] > 0) {
+        const GLuint q = _sg_gpu_timing_gl_queries[p][_sg_gpu_timing_gl_tail[p]];
         GLuint avail = 0;
         glGetQueryObjectuiv(q, GL_QUERY_RESULT_AVAILABLE, &avail);
         if (0 == avail) {
@@ -12869,76 +12903,236 @@ _SOKOL_PRIVATE void _sg_agate_gl_reap(int p) {
         uint64_t ns = 0;
         glGetQueryObjectui64v(q, GL_QUERY_RESULT, &ns);
         const double ms = (double)ns / 1000000.0;
-        if ((ms > 0.0) && (ms < 10000.0)) {
-            _sg_agate_gl_last_ms[p] = (float)ms;
+        if ((ms >= 0.0) && (ms < 10000.0)) {
+            _sg_gpu_timing_gl_last_ms[p] = (float)ms;
+            _sg_gpu_timing_gl_last_frame[p] = _sg_gpu_timing_gl_begin_frame[p][_sg_gpu_timing_gl_tail[p]];
         }
-        _sg_agate_gl_tail[p] = (uint8_t)((_sg_agate_gl_tail[p] + 1) % _SG_AGATE_GPU_QUERY_DEPTH);
-        _sg_agate_gl_pending[p]--;
+        _sg_gpu_timing_gl_tail[p] = (uint8_t)((_sg_gpu_timing_gl_tail[p] + 1) % _SG_GPU_TIMING_QUERY_DEPTH);
+        _sg_gpu_timing_gl_pending[p]--;
     }
 }
-_SOKOL_PRIVATE void _sg_agate_gl_drain_all(void) {
+_SOKOL_PRIVATE void _sg_gpu_timing_gl_drain_all(void) {
     int p;
-    for (p = 0; p < _SG_AGATE_GPU_PASSES; p++) {
-        _sg_agate_gl_reap(p);
+    for (p = 0; p < SG_MAX_GPU_TIMING_SCOPES; p++) {
+        _sg_gpu_timing_gl_reap(p);
     }
 }
-// Close any still-open query (normally a no-op: engine phases are
-// strictly sequential, so an open query here means unbalanced calls).
+// Close any still-open query (normally a no-op: scope brackets are
+// sequential and non-nested, so an open query here means unbalanced calls).
 // The closed query joins the retire queue; the slot advances.
-_SOKOL_PRIVATE void _sg_agate_gl_close_active(void) {
-    if (_sg_agate_gl_active >= 0) {
-        const int ap = _sg_agate_gl_active;
+_SOKOL_PRIVATE void _sg_gpu_timing_gl_close_active(void) {
+    if (_sg_gpu_timing_gl_active >= 0) {
+        const int ap = _sg_gpu_timing_gl_active;
         glEndQuery(GL_TIME_ELAPSED);
-        _sg_agate_gl_active = -1;
-        _sg_agate_gl_pending[ap]++;
-        _sg_agate_gl_head[ap] = (uint8_t)((_sg_agate_gl_head[ap] + 1) % _SG_AGATE_GPU_QUERY_DEPTH);
+        _sg_gpu_timing_gl_active = -1;
+        _sg_gpu_timing_gl_pending[ap]++;
+        _sg_gpu_timing_gl_head[ap] = (uint8_t)((_sg_gpu_timing_gl_head[ap] + 1) % _SG_GPU_TIMING_QUERY_DEPTH);
     }
 }
-// (Re)configure the pool on enable/disable. Disable deletes live queries
-// and resets the caches so a later enable starts clean.
-_SOKOL_PRIVATE void _sg_agate_gl_apply_enabled(bool enabled) {
-    _sg_agate_gl_enabled = enabled;
+// Zero all pool state without GL calls (fresh setup after shutdown).
+_SOKOL_PRIVATE void _sg_gpu_timing_gl_reset(void) {
+    int p, i;
+    _sg_gpu_timing_gl_enabled = false;
+    for (p = 0; p < SG_MAX_GPU_TIMING_SCOPES; p++) {
+        for (i = 0; i < _SG_GPU_TIMING_QUERY_DEPTH; i++) {
+            _sg_gpu_timing_gl_queries[p][i] = 0;
+            _sg_gpu_timing_gl_begin_frame[p][i] = 0;
+        }
+        _sg_gpu_timing_gl_head[p] = 0;
+        _sg_gpu_timing_gl_tail[p] = 0;
+        _sg_gpu_timing_gl_pending[p] = 0;
+        _sg_gpu_timing_gl_last_ms[p] = -1.0f;
+        _sg_gpu_timing_gl_last_frame[p] = 0;
+        _sg_gpu_timing_gl_pub_ms[p] = -1.0f;
+        _sg_gpu_timing_gl_pub_frame[p] = 0;
+    }
+    _sg_gpu_timing_gl_active = -1;
+    _sg_gpu_timing_gl_pub_fms = -1.0f;
+    _sg_gpu_timing_gl_pub_fframe = 0;
+}
+// (Re)configure the pool on enable/disable. Idempotent on repeat calls.
+// Disable ends any still-open query, deletes live queries and resets
+// caches so enable starts clean.
+_SOKOL_PRIVATE void _sg_gpu_timing_gl_apply_enabled(bool enabled) {
+    if (enabled == _sg_gpu_timing_gl_enabled) {
+        return;
+    }
+    if (!enabled && (_sg_gpu_timing_gl_active >= 0)) {
+        // unbalanced mid-scope disable: end before delete, drop the sample
+        glEndQuery(GL_TIME_ELAPSED);
+        _sg_gpu_timing_gl_active = -1;
+    }
+    _sg_gpu_timing_gl_enabled = enabled;
     if (!enabled) {
         int p;
-        for (p = 0; p < _SG_AGATE_GPU_PASSES; p++) {
-            GLuint ids[_SG_AGATE_GPU_QUERY_DEPTH];
+        for (p = 0; p < SG_MAX_GPU_TIMING_SCOPES; p++) {
+            GLuint ids[_SG_GPU_TIMING_QUERY_DEPTH];
             int n = 0;
             int i;
-            for (i = 0; i < _SG_AGATE_GPU_QUERY_DEPTH; i++) {
-                if (_sg_agate_gl_queries[p][i] != 0) {
-                    ids[n++] = _sg_agate_gl_queries[p][i];
-                    _sg_agate_gl_queries[p][i] = 0;
+            for (i = 0; i < _SG_GPU_TIMING_QUERY_DEPTH; i++) {
+                if (_sg_gpu_timing_gl_queries[p][i] != 0) {
+                    ids[n++] = _sg_gpu_timing_gl_queries[p][i];
                 }
             }
             if (n > 0) {
                 glDeleteQueries((GLsizei)n, ids);
             }
-            _sg_agate_gl_head[p] = 0;
-            _sg_agate_gl_tail[p] = 0;
-            _sg_agate_gl_pending[p] = 0;
-            _sg_agate_gl_last_ms[p] = -1.0f;
         }
-        _sg_agate_gl_active = -1;
+        _sg_gpu_timing_gl_reset();
     }
 }
+// Backend shutdown: delete live queries while the context is alive,
+// then clear. No-op when never enabled (zero GL calls).
+_SOKOL_PRIVATE void _sg_gpu_timing_gl_teardown(void) {
+    if (_sg_gpu_timing_gl_enabled) {
+        _sg_gpu_timing_gl_apply_enabled(false);
+    } else {
+        _sg_gpu_timing_gl_reset();
+    }
+}
+// Frame scope: sum of last-completed per-scope values, only when every
+// sampled scope shares one frame tag (never mix frames). Scopes with no
+// sample yet contribute 0. Returns -1 when empty or tags disagree.
+// Publishes the served pair for the matching index getter (no re-reap).
+_SOKOL_PRIVATE float _sg_gpu_timing_gl_frame_ms(uint32_t* out_frame) {
+    float sum_ms = 0.0f;
+    uint32_t tag = 0;
+    bool any = false;
+    bool mixed = false;
+    int p;
+    _sg_gpu_timing_gl_drain_all();
+    for (p = 0; p < SG_MAX_GPU_TIMING_SCOPES; p++) {
+        if (_sg_gpu_timing_gl_last_ms[p] >= 0.0f) {
+            if (!any) {
+                tag = _sg_gpu_timing_gl_last_frame[p];
+            } else if (_sg_gpu_timing_gl_last_frame[p] != tag) {
+                mixed = true;
+            }
+            sum_ms += _sg_gpu_timing_gl_last_ms[p];
+            any = true;
+        }
+    }
+    if (!any || mixed) {
+        if (out_frame) { *out_frame = 0; }
+        _sg_gpu_timing_gl_pub_fms = -1.0f;
+        _sg_gpu_timing_gl_pub_fframe = 0;
+        return -1.0f;
+    }
+    if (out_frame) { *out_frame = tag; }
+    _sg_gpu_timing_gl_pub_fms = sum_ms;
+    _sg_gpu_timing_gl_pub_fframe = tag;
+    return sum_ms;
+}
+// Snapshot reader for the frame index: the tag of the last frame ms
+// query, 0 when that query served -1. Never reaps, never polls.
+_SOKOL_PRIVATE uint32_t _sg_gpu_timing_gl_frame_index(void) {
+    if (_sg_gpu_timing_gl_pub_fms < 0.0f) {
+        return 0;
+    }
+    return _sg_gpu_timing_gl_pub_fframe;
+}
+// Per-scope entry points (GL region owns the query pools, so the public
+// wrappers below just dispatch here on GL builds). Invalid ids and any
+// call while disabled are silent no-ops / -1 / 0 (fail-closed).
+_SOKOL_PRIVATE bool _sg_gpu_timing_gl_supported(void) {
+    return true;
+}
+_SOKOL_PRIVATE void _sg_gpu_timing_gl_scope_begin(int pass) {
+    GLuint q;
+    if (!_sg_gpu_timing_gl_enabled || (pass < 0) || (pass >= SG_MAX_GPU_TIMING_SCOPES)) {
+        return;
+    }
+    _sg_gpu_timing_gl_close_active();
+    _sg_gpu_timing_gl_reap(pass);
+    if (_sg_gpu_timing_gl_pending[pass] >= _SG_GPU_TIMING_QUERY_DEPTH) {
+        // ring full, oldest still in flight: drop this sample, never stall
+        return;
+    }
+    q = _sg_gpu_timing_gl_queries[pass][_sg_gpu_timing_gl_head[pass]];
+    if (0 == q) {
+        glGenQueries(1, &q);
+        if (0 == q) {
+            return;
+        }
+        _sg_gpu_timing_gl_queries[pass][_sg_gpu_timing_gl_head[pass]] = q;
+    }
+    // tag with the submission frame; reap copies it to the completed sample
+    _sg_gpu_timing_gl_begin_frame[pass][_sg_gpu_timing_gl_head[pass]] = _sg.frame_index;
+    glBeginQuery(GL_TIME_ELAPSED, q);
+    _sg_gpu_timing_gl_active = pass;
+}
+_SOKOL_PRIVATE void _sg_gpu_timing_gl_scope_end(int pass) {
+    if (!_sg_gpu_timing_gl_enabled || (pass < 0) || (pass >= SG_MAX_GPU_TIMING_SCOPES)) {
+        return;
+    }
+    if (_sg_gpu_timing_gl_active == pass) {
+        _sg_gpu_timing_gl_close_active();
+    }
+}
+_SOKOL_PRIVATE float _sg_gpu_timing_gl_scope_ms(int pass) {
+    if (!_sg_gpu_timing_gl_enabled || (pass < 0) || (pass >= SG_MAX_GPU_TIMING_SCOPES)) {
+        return -1.0f;
+    }
+    _sg_gpu_timing_gl_reap(pass);
+    // publish for the matching index getter (single refresh per ms query)
+    _sg_gpu_timing_gl_pub_ms[pass] = _sg_gpu_timing_gl_last_ms[pass];
+    _sg_gpu_timing_gl_pub_frame[pass] = (_sg_gpu_timing_gl_last_ms[pass] >= 0.0f) ?
+        _sg_gpu_timing_gl_last_frame[pass] : 0;
+    return _sg_gpu_timing_gl_last_ms[pass];
+}
+_SOKOL_PRIVATE uint32_t _sg_gpu_timing_gl_scope_frame(int pass) {
+    // snapshot reader: the tag of the last pass ms query, 0 when that
+    // query served -1. Never reaps, never polls.
+    if (!_sg_gpu_timing_gl_enabled || (pass < 0) || (pass >= SG_MAX_GPU_TIMING_SCOPES)) {
+        return 0;
+    }
+    return _sg_gpu_timing_gl_pub_frame[pass];
+}
 #else
-// Non-GL-eligible builds (Metal uses the v1 frame timer; Win32-GL has no
-// timer entry points in the embedded loader; GLES3/D3D11/WGPU/Vulkan/
-// dummy have no support): stubs so the public entry points always link
-// and every query stays fail-closed at -1.
-_SOKOL_PRIVATE void _sg_agate_gl_apply_enabled(bool enabled) {
+// Non-GL-eligible builds (Win32-GL has no timer entry points in the
+// embedded loader; GLES3/D3D11/WGPU/Vulkan/dummy have no support):
+// stubs so the entry points below always link and stay fail-closed.
+_SOKOL_PRIVATE void _sg_gpu_timing_gl_reset(void) {
+}
+_SOKOL_PRIVATE void _sg_gpu_timing_gl_apply_enabled(bool enabled) {
     (void)enabled;
 }
-_SOKOL_PRIVATE void _sg_agate_gl_drain_all(void) {
+_SOKOL_PRIVATE void _sg_gpu_timing_gl_teardown(void) {
+}
+_SOKOL_PRIVATE void _sg_gpu_timing_gl_drain_all(void) {
+}
+_SOKOL_PRIVATE float _sg_gpu_timing_gl_frame_ms(uint32_t* out_frame) {
+    if (out_frame) { *out_frame = 0; }
+    return -1.0f;
+}
+_SOKOL_PRIVATE uint32_t _sg_gpu_timing_gl_frame_index(void) {
+    return 0;
+}
+_SOKOL_PRIVATE bool _sg_gpu_timing_gl_supported(void) {
+    return false;
+}
+_SOKOL_PRIVATE void _sg_gpu_timing_gl_scope_begin(int pass) {
+    (void)pass;
+}
+_SOKOL_PRIVATE void _sg_gpu_timing_gl_scope_end(int pass) {
+    (void)pass;
+}
+_SOKOL_PRIVATE float _sg_gpu_timing_gl_scope_ms(int pass) {
+    (void)pass;
+    return -1.0f;
+}
+_SOKOL_PRIVATE uint32_t _sg_gpu_timing_gl_scope_frame(int pass) {
+    (void)pass;
+    return 0;
 }
 #endif
 // ---------------------------------------------------------------------------
 _SOKOL_PRIVATE void _sg_gl_commit(void) {
 #if defined(SOKOL_GLCORE) && !defined(_WIN32)
-    // AGATE GPU TIMINGS v2: reap retired timer queries once per frame.
+    // GPU TIMINGS: reap retired timer queries once per frame.
     // Non-blocking, context thread only; one predictable branch while off.
-    if (_sg_agate_gl_enabled) {
-        _sg_agate_gl_drain_all();
+    if (_sg_gpu_timing_gl_enabled) {
+        _sg_gpu_timing_gl_drain_all();
     }
 #endif
     // "soft" clear bindings (only those that are actually bound)
@@ -16313,12 +16507,545 @@ _SOKOL_PRIVATE void _sg_mtl_init_caps(void) {
     _sg_pixelformat_compute_all(&_sg.formats[SG_PIXELFORMAT_RGBA32F]);
 }
 
+// GPU TIMINGS (Metal backend):
+// frame = full command-buffer span (GPUStartTime/GPUEndTime) served from
+// a 4-slot ring of retained buffers, so a slow GPU keeps older samples.
+// scopes = counter-aggregated FIRST start to LAST end per caller scope,
+// sampled at stage boundary into a per-frame MTLCounterSampleBuffer
+// (timestamp set, shared storage). Render encoders preassign 4 indices
+// (vertex start/end, fragment start/end), compute encoders 2, always at
+// encoder creation: descriptors are consumed by creation, a later edit
+// would miss. Context thread only, no atomics, never waits on the GPU.
+// Retains go through _SG_OBJC macros (ARC and MRR safe); plain-data
+// slot structs hold no ObjC pointers, the two retained objects live in
+// side arrays so the structs stay memset-safe under ARC.
+#if defined(SOKOL_METAL)
+#define _SG_GPU_TIMING_MTL_RING (4)
+#define _SG_GPU_TIMING_MTL_MAX_NATIVE (128)
+#define _SG_GPU_TIMING_MTL_CTR_PER_NATIVE (4)
+typedef struct {
+    uint32_t frame;     // submission _sg.frame_index, 0 = empty slot
+    int native_count;   // timestamped native passes in this frame
+    bool overflow;      // native cap hit: counters invalid, drop sample
+    bool cb_done;       // frame span resolved (or unresolvable)
+    float frame_ms;     // cached full-CB span, -1 when invalid
+    bool ctr_done;      // counters resolved (or unresolvable)
+    bool ctr_valid;     // resolved timestamps usable
+    uint64_t ts[_SG_GPU_TIMING_MTL_MAX_NATIVE * _SG_GPU_TIMING_MTL_CTR_PER_NATIVE];
+    uint8_t native_kind[_SG_GPU_TIMING_MTL_MAX_NATIVE];   // 0=compute(2 ctr), 1=render(4 ctr)
+    bool scope_has[SG_MAX_GPU_TIMING_SCOPES];
+    int scope_first[SG_MAX_GPU_TIMING_SCOPES];
+    int scope_last[SG_MAX_GPU_TIMING_SCOPES];   // exclusive native index
+    float scope_ms[SG_MAX_GPU_TIMING_SCOPES];
+    uint32_t scope_frame[SG_MAX_GPU_TIMING_SCOPES];
+} _sg_gpu_timing_mtl_slot_t;
+static bool _sg_gpu_timing_mtl_enabled = false;
+static _sg_gpu_timing_mtl_slot_t _sg_gpu_timing_mtl_slots[_SG_GPU_TIMING_MTL_RING] = { {0} };
+static id<MTLCommandBuffer> _sg_gpu_timing_mtl_cb[_SG_GPU_TIMING_MTL_RING] = { nil };
+static id<MTLCounterSampleBuffer> _sg_gpu_timing_mtl_sb[_SG_GPU_TIMING_MTL_RING] = { nil };
+static int _sg_gpu_timing_mtl_open_scope = -1;   // timing scope currently open
+static int _sg_gpu_timing_mtl_open_first = 0;    // its start native index
+static int _sg_gpu_timing_mtl_cur = -1;          // assembly slot, -1 = none
+static int _sg_gpu_timing_mtl_probe = 0;         // 0 unprobed, 1 ok, -1 no
+// last PUBLISHED snapshot: written once by each ms query, read verbatim
+// by the index getters (which never resolve, so a paired ms/index call
+// set can't straddle an async GPU completion)
+static float _sg_gpu_timing_mtl_pub_fms = -1.0f;
+static uint32_t _sg_gpu_timing_mtl_pub_fframe = 0;
+static float _sg_gpu_timing_mtl_pub_pms[SG_MAX_GPU_TIMING_SCOPES] = { 0 };
+static uint32_t _sg_gpu_timing_mtl_pub_pframe[SG_MAX_GPU_TIMING_SCOPES] = { 0 };
+// Handoff helper: move our retain into the deferred release queue so an
+// in-flight GPU write stays valid under unretained command buffers.
+_SOKOL_PRIVATE void _sg_gpu_timing_mtl_defer(id obj) {
+    if (nil != obj) {
+        _sg_mtl_release_resource(_sg.frame_index, _sg_mtl_add_resource(obj));
+        #if __has_feature(objc_arc)
+            _SOKOL_UNUSED(obj);
+        #else
+            [obj release];  // queue array holds its own retain now
+        #endif
+    }
+}
+// Release one slot side: completed work frees now, in-flight work frees
+// via the deferred queue (never stalls, never truncates another sample).
+_SOKOL_PRIVATE void _sg_gpu_timing_mtl_evict(int s) {
+    SOKOL_ASSERT((s >= 0) && (s < _SG_GPU_TIMING_MTL_RING));
+    bool done = false;
+    if (nil != _sg_gpu_timing_mtl_cb[s]) {
+        done = ([_sg_gpu_timing_mtl_cb[s] status] == MTLCommandBufferStatusCompleted) ||
+               ([_sg_gpu_timing_mtl_cb[s] status] == MTLCommandBufferStatusError);
+    } else {
+        done = true;
+    }
+    if (done) {
+        _SG_OBJC_RELEASE(_sg_gpu_timing_mtl_cb[s]);
+        _SG_OBJC_RELEASE(_sg_gpu_timing_mtl_sb[s]);
+    } else {
+        _sg_gpu_timing_mtl_defer(_sg_gpu_timing_mtl_cb[s]);
+        _sg_gpu_timing_mtl_cb[s] = nil;
+        _sg_gpu_timing_mtl_defer(_sg_gpu_timing_mtl_sb[s]);
+        _sg_gpu_timing_mtl_sb[s] = nil;
+    }
+    memset(&_sg_gpu_timing_mtl_slots[s], 0, sizeof(_sg_gpu_timing_mtl_slots[s]));
+    _sg_gpu_timing_mtl_slots[s].frame_ms = -1.0f;
+    for (int p = 0; p < SG_MAX_GPU_TIMING_SCOPES; p++) {
+        _sg_gpu_timing_mtl_slots[s].scope_ms[p] = -1.0f;
+    }
+}
+// Capability probe, cached per setup. True only for stage-boundary
+// timestamp counters; any other counter mechanism reads as unsupported.
+_SOKOL_PRIVATE bool _sg_gpu_timing_mtl_counters_usable(void) {
+    if (!_sg.valid) {
+        return false;
+    }
+    if (0 == _sg_gpu_timing_mtl_probe) {
+        bool ok = false;
+        if (_sg.mtl.valid && (nil != _sg.mtl.device)) {
+            if (@available(macOS 11.0, iOS 14.0, *)) {
+                if ([_sg.mtl.device supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) {
+                    for (id<MTLCounterSet> set in [_sg.mtl.device counterSets]) {
+                        if ([set.name isEqualToString:MTLCommonCounterSetTimestamp]) {
+                            ok = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        _sg_gpu_timing_mtl_probe = ok ? 1 : -1;
+    }
+    return _sg_gpu_timing_mtl_probe > 0;
+}
+// Claim the ring slot for the current _sg.frame_index. Evicts whatever
+// sits there (bounded ring: the evicted sample is dropped whole).
+_SOKOL_PRIVATE int _sg_gpu_timing_mtl_claim(void) {
+    const int s = (int)(_sg.frame_index % (uint32_t)_SG_GPU_TIMING_MTL_RING);
+    _sg_gpu_timing_mtl_evict(s);
+    _sg_gpu_timing_mtl_slots[s].frame = _sg.frame_index;
+    return s;
+}
+// Lazily create this frame's counter storage. Failure skips counters
+// for the frame (fail-closed) without touching the enabled intent.
+_SOKOL_PRIVATE bool _sg_gpu_timing_mtl_ensure_sb(int s) {
+    if (nil != _sg_gpu_timing_mtl_sb[s]) {
+        return true;
+    }
+    if (!_sg_gpu_timing_mtl_counters_usable()) {
+        return false;
+    }
+    id<MTLCounterSampleBuffer> sb = nil;
+    if (@available(macOS 11.0, iOS 14.0, *)) {
+        id<MTLCounterSet> ts_set = nil;
+        for (id<MTLCounterSet> set in [_sg.mtl.device counterSets]) {
+            if ([set.name isEqualToString:MTLCommonCounterSetTimestamp]) {
+                ts_set = set;
+                break;
+            }
+        }
+        if (nil != ts_set) {
+            MTLCounterSampleBufferDescriptor* desc = [[MTLCounterSampleBufferDescriptor alloc] init];
+            desc.counterSet = ts_set;
+            desc.storageMode = MTLStorageModeShared;
+            desc.sampleCount = (NSUInteger)(_SG_GPU_TIMING_MTL_MAX_NATIVE * _SG_GPU_TIMING_MTL_CTR_PER_NATIVE);
+            NSError* err = nil;
+            sb = [_sg.mtl.device newCounterSampleBufferWithDescriptor:desc error:&err];
+            _SG_OBJC_RELEASE(desc);
+        }
+    }
+    if (nil == sb) {
+        return false;
+    }
+    _sg_gpu_timing_mtl_sb[s] = sb;   // ARC retains; MRR takes over the +1
+    #if __has_feature(objc_arc)
+        _SOKOL_UNUSED(sb);
+    #endif
+    return true;
+}
+// Reserve counter indices for one render native pass and preassign them
+// on the descriptor (runs before encoder creation consumes it). Returns
+// the counter base, or -1 when counters are unusable this frame.
+_SOKOL_PRIVATE int _sg_gpu_timing_mtl_stamp_render(MTLRenderPassDescriptor* pass_desc) {
+    if (!_sg_gpu_timing_mtl_enabled) {
+        return -1;
+    }
+    if (_sg_gpu_timing_mtl_cur < 0) {
+        _sg_gpu_timing_mtl_cur = _sg_gpu_timing_mtl_claim();
+    }
+    _sg_gpu_timing_mtl_slot_t* slot = &_sg_gpu_timing_mtl_slots[_sg_gpu_timing_mtl_cur];
+    if (slot->overflow || (slot->native_count >= _SG_GPU_TIMING_MTL_MAX_NATIVE)) {
+        slot->overflow = true;
+        return -1;
+    }
+    if (!_sg_gpu_timing_mtl_ensure_sb(_sg_gpu_timing_mtl_cur)) {
+        slot->overflow = true;
+        return -1;
+    }
+    const int base = slot->native_count * _SG_GPU_TIMING_MTL_CTR_PER_NATIVE;
+    if (@available(macOS 11.0, iOS 14.0, *)) {
+        pass_desc.sampleBufferAttachments[0].sampleBuffer = _sg_gpu_timing_mtl_sb[_sg_gpu_timing_mtl_cur];
+        pass_desc.sampleBufferAttachments[0].startOfVertexSampleIndex = (NSUInteger)base;
+        pass_desc.sampleBufferAttachments[0].endOfVertexSampleIndex = (NSUInteger)(base + 1);
+        pass_desc.sampleBufferAttachments[0].startOfFragmentSampleIndex = (NSUInteger)(base + 2);
+        pass_desc.sampleBufferAttachments[0].endOfFragmentSampleIndex = (NSUInteger)(base + 3);
+    }
+    slot->native_kind[slot->native_count] = 1;
+    slot->native_count++;
+    return base;
+}
+// Same for compute: fills a fresh compute descriptor (2 indices), the
+// caller creates the encoder from it. Returns base or -1.
+_SOKOL_PRIVATE int _sg_gpu_timing_mtl_stamp_compute(MTLComputePassDescriptor* cp_desc) {
+    if (!_sg_gpu_timing_mtl_enabled) {
+        return -1;
+    }
+    if (_sg_gpu_timing_mtl_cur < 0) {
+        _sg_gpu_timing_mtl_cur = _sg_gpu_timing_mtl_claim();
+    }
+    _sg_gpu_timing_mtl_slot_t* slot = &_sg_gpu_timing_mtl_slots[_sg_gpu_timing_mtl_cur];
+    if (slot->overflow || (slot->native_count >= _SG_GPU_TIMING_MTL_MAX_NATIVE)) {
+        slot->overflow = true;
+        return -1;
+    }
+    if (!_sg_gpu_timing_mtl_ensure_sb(_sg_gpu_timing_mtl_cur)) {
+        slot->overflow = true;
+        return -1;
+    }
+    const int base = slot->native_count * _SG_GPU_TIMING_MTL_CTR_PER_NATIVE;
+    if (@available(macOS 11.0, iOS 14.0, *)) {
+        cp_desc.sampleBufferAttachments[0].sampleBuffer = _sg_gpu_timing_mtl_sb[_sg_gpu_timing_mtl_cur];
+        cp_desc.sampleBufferAttachments[0].startOfEncoderSampleIndex = (NSUInteger)base;
+        cp_desc.sampleBufferAttachments[0].endOfEncoderSampleIndex = (NSUInteger)(base + 1);
+    }
+    slot->native_kind[slot->native_count] = 0;
+    slot->native_count++;
+    return base;
+}
+// Mark the assembling frame's counters invalid (whole sample dropped,
+// never truncated). Used when a stamped encoder fails to create.
+_SOKOL_PRIVATE void _sg_gpu_timing_mtl_invalidate_cur(void) {
+    if (_sg_gpu_timing_mtl_cur >= 0) {
+        _sg_gpu_timing_mtl_slots[_sg_gpu_timing_mtl_cur].overflow = true;
+    }
+}
+// Forward declarations (resolve/scope helpers call each other).
+_SOKOL_PRIVATE float _sg_gpu_timing_mtl_scope_span(const _sg_gpu_timing_mtl_slot_t* slot, int p);
+_SOKOL_PRIVATE void _sg_gpu_timing_mtl_scope_end(int pass);
+// Resolve one slot once its buffer completed: full-CB frame span plus
+// raw counter timestamps. Never waits; unresolvable slots are marked
+// done-invalid so queries stay fail-closed instead of stalling.
+_SOKOL_PRIVATE void _sg_gpu_timing_mtl_resolve_slot(int s) {
+    SOKOL_ASSERT((s >= 0) && (s < _SG_GPU_TIMING_MTL_RING));
+    _sg_gpu_timing_mtl_slot_t* slot = &_sg_gpu_timing_mtl_slots[s];
+    id<MTLCommandBuffer> cb = _sg_gpu_timing_mtl_cb[s];
+    if ((0 == slot->frame) || (nil == cb)) {
+        return;
+    }
+    const MTLCommandBufferStatus st = [cb status];
+    if (!slot->cb_done && ((st == MTLCommandBufferStatusCompleted) || (st == MTLCommandBufferStatusError))) {
+        slot->cb_done = true;
+        slot->frame_ms = -1.0f;
+        if (st == MTLCommandBufferStatusCompleted) {
+            const CFTimeInterval start = [cb GPUStartTime];
+            const CFTimeInterval end = [cb GPUEndTime];
+            if ((end > start) && ((end - start) < 10.0)) {
+                slot->frame_ms = (float)((end - start) * 1000.0);
+            }
+        }
+    }
+    if (!slot->ctr_done && (st == MTLCommandBufferStatusCompleted) && (nil != _sg_gpu_timing_mtl_sb[s])) {
+        slot->ctr_done = true;
+        slot->ctr_valid = false;
+        if (!slot->overflow && (slot->native_count > 0)) {
+            const NSUInteger n = (NSUInteger)(slot->native_count * _SG_GPU_TIMING_MTL_CTR_PER_NATIVE);
+            NSData* data = [_sg_gpu_timing_mtl_sb[s] resolveCounterRange:NSMakeRange(0, n)];
+            if ((nil != data) && ([data length] == (n * sizeof(uint64_t)))) {
+                memcpy(slot->ts, [data bytes], (size_t)[data length]);
+                slot->ctr_valid = true;
+            }
+        } else if (!slot->overflow) {
+            slot->ctr_valid = true; // no natives: no scope ranges exist
+        }
+        if (slot->ctr_valid) {
+            for (int p = 0; p < SG_MAX_GPU_TIMING_SCOPES; p++) {
+                if (slot->scope_has[p]) {
+                    slot->scope_ms[p] = _sg_gpu_timing_mtl_scope_span(slot, p);
+                    if (slot->scope_ms[p] >= 0.0f) {
+                        slot->scope_frame[p] = slot->frame;
+                    }
+                }
+            }
+        }
+    }
+    if (!slot->ctr_done && (st == MTLCommandBufferStatusError)) {
+        slot->ctr_done = true;
+        slot->ctr_valid = false;
+    }
+}
+// Aggregate FIRST start to LAST end over a scope's native range.
+// Render native i: min(vertex start, fragment start) to max(vertex end,
+// fragment end). Compute native i: encoder start to encoder end (its two
+// reserved spare slots are never written, so only indices 0..1 read).
+// Any error value, end < start, or >= 10 s span invalidates the sample.
+// An empty range measures nothing, so it is unavailable (-1): no zero is
+// fabricated for unmeasured native work. A measured zero (quantized
+// timestamps) stays a valid 0 ms.
+_SOKOL_PRIVATE float _sg_gpu_timing_mtl_scope_span(const _sg_gpu_timing_mtl_slot_t* slot, int p) {
+    SOKOL_ASSERT(slot && (p >= 0) && (p < SG_MAX_GPU_TIMING_SCOPES));
+    const int first = slot->scope_first[p];
+    const int last = slot->scope_last[p];
+    if ((first < 0) || (last < first) || (last > slot->native_count)) {
+        return -1.0f;
+    }
+    if (first == last) {
+        return -1.0f;
+    }
+    uint64_t start = 0, end = 0;
+    for (int i = first; i < last; i++) {
+        const uint64_t* t = &slot->ts[i * _SG_GPU_TIMING_MTL_CTR_PER_NATIVE];
+        uint64_t s0, e0;
+        if (slot->native_kind[i] == 0) {
+            s0 = t[0];
+            e0 = t[1];
+            if ((s0 == MTLCounterErrorValue) || (e0 == MTLCounterErrorValue)) {
+                return -1.0f;
+            }
+        } else {
+            for (int k = 0; k < _SG_GPU_TIMING_MTL_CTR_PER_NATIVE; k++) {
+                if (t[k] == MTLCounterErrorValue) {
+                    return -1.0f;
+                }
+            }
+            s0 = (t[0] < t[2]) ? t[0] : t[2];
+            e0 = (t[1] > t[3]) ? t[1] : t[3];
+        }
+        if (e0 < s0) {
+            return -1.0f;
+        }
+        if (i == first) {
+            start = s0;
+            end = e0;
+        } else {
+            if (s0 < start) {
+                start = s0;
+            }
+            if (e0 > end) {
+                end = e0;
+            }
+        }
+    }
+    if (end < start) {
+        return -1.0f;
+    }
+    const double ms = ((double)(end - start)) / 1000000.0;
+    if ((ms < 0.0) || (ms >= 10000.0)) {
+        return -1.0f;
+    }
+    return (float)ms;
+}
+// Opportunistic resolve over the ring (commit + query paths). No waits.
+_SOKOL_PRIVATE void _sg_gpu_timing_mtl_resolve(void) {
+    for (int s = 0; s < _SG_GPU_TIMING_MTL_RING; s++) {
+        _sg_gpu_timing_mtl_resolve_slot(s);
+    }
+}
+// Commit hook: force-close any open scope into this frame (scopes never
+// span commits, mixing frames is forbidden), retain the committed buffer
+// with its submission tag, rotate assembly to the next frame.
+_SOKOL_PRIVATE void _sg_gpu_timing_mtl_on_commit(void) {
+    if (!_sg_gpu_timing_mtl_enabled) {
+        _sg_gpu_timing_mtl_cur = -1;
+        _sg_gpu_timing_mtl_open_scope = -1;
+        _sg_gpu_timing_mtl_resolve();
+        return;
+    }
+    if ((_sg_gpu_timing_mtl_cur >= 0) && (_sg_gpu_timing_mtl_open_scope >= 0)) {
+        _sg_gpu_timing_mtl_slot_t* slot = &_sg_gpu_timing_mtl_slots[_sg_gpu_timing_mtl_cur];
+        const int p = _sg_gpu_timing_mtl_open_scope;
+        slot->scope_has[p] = true;
+        slot->scope_first[p] = _sg_gpu_timing_mtl_open_first;
+        slot->scope_last[p] = slot->native_count;
+    }
+    // scopes never span commits (pass-less frames drop the open range)
+    _sg_gpu_timing_mtl_open_scope = -1;
+    if (nil != _sg.mtl.cmd_buffer) {
+        if (_sg_gpu_timing_mtl_cur < 0) {
+            // frame without native passes: still time the full buffer
+            _sg_gpu_timing_mtl_cur = _sg_gpu_timing_mtl_claim();
+        }
+        const int s = _sg_gpu_timing_mtl_cur;
+        _SG_OBJC_RELEASE(_sg_gpu_timing_mtl_cb[s]);
+        _sg_gpu_timing_mtl_cb[s] = _sg.mtl.cmd_buffer;
+        #if __has_feature(objc_arc)
+            // ARC strong assign retained; nothing more to do
+        #else
+            [_sg_gpu_timing_mtl_cb[s] retain];
+        #endif
+        _sg_gpu_timing_mtl_cur = -1;
+    } else {
+        _sg_gpu_timing_mtl_cur = -1;
+    }
+    _sg_gpu_timing_mtl_resolve();
+}
+// Reset without GPU calls (fresh setup). Release lists are empty here:
+// setup only runs on a fresh or fully discarded context.
+_SOKOL_PRIVATE void _sg_gpu_timing_mtl_reset(void) {
+    _sg_gpu_timing_mtl_enabled = false;
+    _sg_gpu_timing_mtl_probe = 0;
+    _sg_gpu_timing_mtl_open_scope = -1;
+    _sg_gpu_timing_mtl_open_first = 0;
+    _sg_gpu_timing_mtl_cur = -1;
+    _sg_gpu_timing_mtl_pub_fms = -1.0f;
+    _sg_gpu_timing_mtl_pub_fframe = 0;
+    for (int p = 0; p < SG_MAX_GPU_TIMING_SCOPES; p++) {
+        _sg_gpu_timing_mtl_pub_pms[p] = -1.0f;
+        _sg_gpu_timing_mtl_pub_pframe[p] = 0;
+    }
+    for (int s = 0; s < _SG_GPU_TIMING_MTL_RING; s++) {
+        _SG_OBJC_RELEASE(_sg_gpu_timing_mtl_cb[s]);
+        _SG_OBJC_RELEASE(_sg_gpu_timing_mtl_sb[s]);
+        memset(&_sg_gpu_timing_mtl_slots[s], 0, sizeof(_sg_gpu_timing_mtl_slots[s]));
+        _sg_gpu_timing_mtl_slots[s].frame_ms = -1.0f;
+        for (int p = 0; p < SG_MAX_GPU_TIMING_SCOPES; p++) {
+            _sg_gpu_timing_mtl_slots[s].scope_ms[p] = -1.0f;
+        }
+    }
+}
+// Teardown: resolve what completed, release the rest (completed frees
+// now, in-flight frees deferred so GPU writes stay valid), then reset.
+// Runs inside discard_backend before garbage collection.
+_SOKOL_PRIVATE void _sg_gpu_timing_mtl_teardown(void) {
+    _sg_gpu_timing_mtl_enabled = false;
+    _sg_gpu_timing_mtl_open_scope = -1;
+    _sg_gpu_timing_mtl_cur = -1;
+    _sg_gpu_timing_mtl_resolve();
+    for (int s = 0; s < _SG_GPU_TIMING_MTL_RING; s++) {
+        _sg_gpu_timing_mtl_evict(s);
+    }
+    _sg_gpu_timing_mtl_probe = 0;
+    _sg_gpu_timing_mtl_pub_fms = -1.0f;
+    _sg_gpu_timing_mtl_pub_fframe = 0;
+    for (int p = 0; p < SG_MAX_GPU_TIMING_SCOPES; p++) {
+        _sg_gpu_timing_mtl_pub_pms[p] = -1.0f;
+        _sg_gpu_timing_mtl_pub_pframe[p] = 0;
+    }
+}
+// Public entry state for the wrappers below (valid-checked there).
+_SOKOL_PRIVATE void _sg_gpu_timing_mtl_set_enabled(bool enabled) {
+    if (enabled == _sg_gpu_timing_mtl_enabled) {
+        return; // idempotent: the parent polls this every frame
+    }
+    if (!enabled) {
+        // mid-frame disable drops the assembling frame whole, never
+        // publishes a truncated sample
+        if (_sg_gpu_timing_mtl_cur >= 0) {
+            _sg_gpu_timing_mtl_slots[_sg_gpu_timing_mtl_cur].overflow = true;
+            _sg_gpu_timing_mtl_cur = -1;
+        }
+        _sg_gpu_timing_mtl_open_scope = -1;
+        _sg_gpu_timing_mtl_resolve();
+        for (int s = 0; s < _SG_GPU_TIMING_MTL_RING; s++) {
+            _sg_gpu_timing_mtl_evict(s);
+        }
+        // drop the published snapshot too: index getters must agree
+        // with the ms queries (which now serve -1)
+        _sg_gpu_timing_mtl_pub_fms = -1.0f;
+        _sg_gpu_timing_mtl_pub_fframe = 0;
+        for (int p = 0; p < SG_MAX_GPU_TIMING_SCOPES; p++) {
+            _sg_gpu_timing_mtl_pub_pms[p] = -1.0f;
+            _sg_gpu_timing_mtl_pub_pframe[p] = 0;
+        }
+    }
+    _sg_gpu_timing_mtl_enabled = enabled;
+}
+_SOKOL_PRIVATE float _sg_gpu_timing_mtl_frame_ms(uint32_t* out_frame) {
+    float best_ms = -1.0f;
+    uint32_t best_frame = 0;
+    _sg_gpu_timing_mtl_resolve();
+    for (int s = 0; s < _SG_GPU_TIMING_MTL_RING; s++) {
+        const _sg_gpu_timing_mtl_slot_t* slot = &_sg_gpu_timing_mtl_slots[s];
+        if (slot->cb_done && (slot->frame_ms >= 0.0f) && (slot->frame > best_frame)) {
+            best_ms = slot->frame_ms;
+            best_frame = slot->frame;
+        }
+    }
+    if (out_frame) { *out_frame = best_frame; }
+    // publish once for the matching index getter (no re-resolve there)
+    _sg_gpu_timing_mtl_pub_fms = best_ms;
+    _sg_gpu_timing_mtl_pub_fframe = (best_ms >= 0.0f) ? best_frame : 0;
+    return best_ms;
+}
+// Snapshot reader for the frame index: the tag of the last frame ms
+// query, 0 when that query served -1. Never resolves, never polls.
+_SOKOL_PRIVATE uint32_t _sg_gpu_timing_mtl_frame_index(void) {
+    if (_sg_gpu_timing_mtl_pub_fms < 0.0f) {
+        return 0;
+    }
+    return _sg_gpu_timing_mtl_pub_fframe;
+}
+_SOKOL_PRIVATE void _sg_gpu_timing_mtl_scope_begin(int pass) {
+    if (!_sg_gpu_timing_mtl_enabled || (pass < 0) || (pass >= SG_MAX_GPU_TIMING_SCOPES)) {
+        return;
+    }
+    if ((_sg_gpu_timing_mtl_open_scope >= 0) && (_sg_gpu_timing_mtl_open_scope != pass)) {
+        _sg_gpu_timing_mtl_scope_end(_sg_gpu_timing_mtl_open_scope);
+    }
+    _sg_gpu_timing_mtl_open_scope = pass;
+    _sg_gpu_timing_mtl_open_first = (_sg_gpu_timing_mtl_cur >= 0) ?
+        _sg_gpu_timing_mtl_slots[_sg_gpu_timing_mtl_cur].native_count : 0;
+}
+_SOKOL_PRIVATE void _sg_gpu_timing_mtl_scope_end(int pass) {
+    if (!_sg_gpu_timing_mtl_enabled || (pass < 0) || (pass >= SG_MAX_GPU_TIMING_SCOPES)) {
+        return;
+    }
+    if (_sg_gpu_timing_mtl_open_scope != pass) {
+        return;
+    }
+    if (_sg_gpu_timing_mtl_cur >= 0) {
+        _sg_gpu_timing_mtl_slot_t* slot = &_sg_gpu_timing_mtl_slots[_sg_gpu_timing_mtl_cur];
+        slot->scope_has[pass] = true;
+        slot->scope_first[pass] = _sg_gpu_timing_mtl_open_first;
+        slot->scope_last[pass] = slot->native_count;
+    }
+    _sg_gpu_timing_mtl_open_scope = -1;
+}
+_SOKOL_PRIVATE float _sg_gpu_timing_mtl_scope_ms(int pass) {
+    if (!_sg_gpu_timing_mtl_enabled || (pass < 0) || (pass >= SG_MAX_GPU_TIMING_SCOPES)) {
+        return -1.0f;
+    }
+    float best_ms = -1.0f;
+    uint32_t best_frame = 0;
+    _sg_gpu_timing_mtl_resolve();
+    for (int s = 0; s < _SG_GPU_TIMING_MTL_RING; s++) {
+        const _sg_gpu_timing_mtl_slot_t* slot = &_sg_gpu_timing_mtl_slots[s];
+        if (slot->ctr_done && slot->ctr_valid && slot->scope_has[pass] &&
+            (slot->scope_ms[pass] >= 0.0f) && (slot->scope_frame[pass] > best_frame))
+        {
+            best_ms = slot->scope_ms[pass];
+            best_frame = slot->scope_frame[pass];
+        }
+    }
+    // publish once for the matching index getter (no re-resolve there)
+    _sg_gpu_timing_mtl_pub_pms[pass] = best_ms;
+    _sg_gpu_timing_mtl_pub_pframe[pass] = (best_ms >= 0.0f) ? best_frame : 0;
+    return best_ms;
+}
+_SOKOL_PRIVATE uint32_t _sg_gpu_timing_mtl_scope_frame(int pass) {
+    // snapshot reader: the tag of the last pass ms query, 0 when that
+    // query served -1. Never resolves, never polls.
+    if (!_sg_gpu_timing_mtl_enabled || (pass < 0) || (pass >= SG_MAX_GPU_TIMING_SCOPES)) {
+        return 0;
+    }
+    return _sg_gpu_timing_mtl_pub_pframe[pass];
+}
+#endif
 //-- main Metal backend state and functions ------------------------------------
 _SOKOL_PRIVATE void _sg_mtl_setup_backend(const sg_desc* desc) {
     // assume already zero-initialized
     SOKOL_ASSERT(desc);
     SOKOL_ASSERT(desc->environment.metal.device);
     SOKOL_ASSERT(desc->uniform_buffer_size > 0);
+    // GPU TIMINGS: fresh context starts off with no objects
+    _sg_gpu_timing_mtl_reset();
     _sg_mtl_init_pool(desc);
     _sg_mtl_clear_state_cache();
     _sg.mtl.valid = true;
@@ -16361,6 +17088,9 @@ _SOKOL_PRIVATE void _sg_mtl_setup_backend(const sg_desc* desc) {
 
 _SOKOL_PRIVATE void _sg_mtl_discard_backend(void) {
     SOKOL_ASSERT(_sg.mtl.valid);
+    // GPU TIMINGS: release timing objects before pool teardown
+    // (in-flight work frees deferred, collected by the call below).
+    _sg_gpu_timing_mtl_teardown();
     // wait for the last frame to finish
     for (int i = 0; i < SG_NUM_INFLIGHT_FRAMES; i++) {
         dispatch_semaphore_wait(_sg.mtl.sem, DISPATCH_TIME_FOREVER);
@@ -17134,10 +17864,28 @@ _SOKOL_PRIVATE void _sg_mtl_begin_compute_pass(const sg_pass* pass) {
     SOKOL_ASSERT(nil == _sg.mtl.compute_cmd_encoder);
     SOKOL_ASSERT(nil == _sg.mtl.render_cmd_encoder);
 
-    _sg.mtl.compute_cmd_encoder = [_sg.mtl.cmd_buffer computeCommandEncoder];
-    if (nil == _sg.mtl.compute_cmd_encoder) {
-        _sg.cur_pass.valid = false;
-        return;
+    if (_sg_gpu_timing_mtl_enabled) {
+        // GPU TIMINGS: compute counters need a pass descriptor, so
+        // timed compute passes use the descriptor-based encoder. The
+        // descriptor (with preassigned indices) is consumed at creation.
+        MTLComputePassDescriptor* cp_desc = [MTLComputePassDescriptor computePassDescriptor];
+        const int timing_base = _sg_gpu_timing_mtl_stamp_compute(cp_desc);
+        if (timing_base >= 0) {
+            _sg.mtl.compute_cmd_encoder = [_sg.mtl.cmd_buffer computeCommandEncoderWithDescriptor:cp_desc];
+        } else {
+            _sg.mtl.compute_cmd_encoder = [_sg.mtl.cmd_buffer computeCommandEncoder];
+        }
+        if (nil == _sg.mtl.compute_cmd_encoder) {
+            _sg.cur_pass.valid = false;
+            _sg_gpu_timing_mtl_invalidate_cur();
+            return;
+        }
+    } else {
+        _sg.mtl.compute_cmd_encoder = [_sg.mtl.cmd_buffer computeCommandEncoder];
+        if (nil == _sg.mtl.compute_cmd_encoder) {
+            _sg.cur_pass.valid = false;
+            return;
+        }
     }
 
     #if defined(SOKOL_DEBUG)
@@ -17293,10 +18041,17 @@ _SOKOL_PRIVATE void _sg_mtl_begin_render_pass(const sg_pass* pass, const _sg_att
     // NOTE: at least in macOS Sonoma, the following is no longer the case, a valid
     // render command encoder is also returned in a minimized window
     // ===
+    // GPU TIMINGS: preassign counter indices now, the descriptor is
+    // consumed by encoder creation (a later edit would miss).
+    const int timing_base = _sg_gpu_timing_mtl_stamp_render(pass_desc);
     // create a render command encoder, this might return nil if window is minimized
     _sg.mtl.render_cmd_encoder = [_sg.mtl.cmd_buffer renderCommandEncoderWithDescriptor:pass_desc];
     if (nil == _sg.mtl.render_cmd_encoder) {
         _sg.cur_pass.valid = false;
+        if (timing_base >= 0) {
+            // stamped but unusable: invalidate this frame's counters whole
+            _sg_gpu_timing_mtl_invalidate_cur();
+        }
         return;
     }
 
@@ -17368,30 +18123,6 @@ _SOKOL_PRIVATE void _sg_mtl_end_pass(const _sg_attachments_ptrs_t* atts) {
     }
 }
 
-// AGATE GPU TIMINGS (agate fork patch):
-// file-static state for the frame-level Metal GPU timer. Written on the
-// context thread only (commit hook + query poll), so no atomics: the Metal
-// runtime publishes GPUStartTime/GPUEndTime once the buffer completes.
-#if defined(SOKOL_METAL)
-static bool _sg_agate_gpu_timing_enabled = false;
-static id<MTLCommandBuffer> _sg_agate_gpu_cb = nil;
-static float _sg_agate_gpu_last_ms = -1.0f;
-// Refresh the last-completed cache from buf once it has finished on GPU.
-// Called for the previous frame's buffer at replace time (a full frame
-// after its commit, so it has normally completed) and opportunistically
-// for the current buffer on query.
-_SOKOL_PRIVATE void _sg_agate_gpu_sample(id<MTLCommandBuffer> buf) {
-    if ((nil != buf) && ([buf status] == MTLCommandBufferStatusCompleted)) {
-        const CFTimeInterval start = [buf GPUStartTime];
-        const CFTimeInterval end = [buf GPUEndTime];
-        if ((end > start) && ((end - start) < 10.0)) {
-            _sg_agate_gpu_last_ms = (float)((end - start) * 1000.0);
-        }
-    }
-}
-#else
-static bool _sg_agate_gpu_timing_enabled = false;
-#endif
 // ---------------------------------------------------------------------------
 _SOKOL_PRIVATE void _sg_mtl_commit(void) {
     SOKOL_ASSERT(nil == _sg.mtl.render_cmd_encoder);
@@ -17401,20 +18132,9 @@ _SOKOL_PRIVATE void _sg_mtl_commit(void) {
     if (_sg.mtl.cmd_buffer) {
         [_sg.mtl.cmd_buffer commit];
     }
-    // AGATE GPU TIMINGS (agate fork patch): while enabled, hold the committed
-    // buffer one extra frame so sg_agate_query_gpu_frame_ms() can serve it.
-    // Context thread only; the in-flight semaphore handshake is untouched.
-    // The previous completed buffer is sampled first (it committed a full
-    // frame ago, so it has normally finished on GPU); at most one extra
-    // buffer is ever retained.
-    if (_sg_agate_gpu_timing_enabled && _sg.mtl.cmd_buffer) {
-        _sg_agate_gpu_sample(_sg_agate_gpu_cb);
-        if (nil != _sg_agate_gpu_cb) {
-            [_sg_agate_gpu_cb release];
-        }
-        [_sg.mtl.cmd_buffer retain];
-        _sg_agate_gpu_cb = _sg.mtl.cmd_buffer;
-    }
+    // GPU TIMINGS: retain the committed buffer with its submission
+    // tag, force-close scopes at the frame edge, resolve what completed.
+    _sg_gpu_timing_mtl_on_commit();
 
     // garbage-collect resources pending for release
     _sg_mtl_garbage_collect(_sg.frame_index);
@@ -19134,6 +19854,436 @@ _SOKOL_PRIVATE bool _sg_wgpu_apply_index_buffer(_sg_bindings_ptrs_t* bnd) {
     return true;
 }
 
+// GPU TIMINGS (WGPU backend):
+// frame = FIRST-to-LAST native-pass timestamp span in the committed frame
+// (includes unattributed passes); scopes = same aggregation per caller
+// scope. One timestamp QuerySet (2 x 128 queries), one resolve buffer
+// (QueryResolve|CopySrc) and a 4-slot MapRead|CopyDst readback ring.
+// Timestamp writes attach at encoder creation (descriptors are consumed
+// there). Per commit: resolve + copy, submit, then MapAsync with a
+// slot-owned meta record; the callback first checks a generation token
+// (userdata2) against the live generation before touching anything, so
+// stale callbacks from a disabled/shut-down context return without
+// dereferencing, freeing, or publishing. No waits and no WorkDone
+// handler: queries stay -1 until the callback lands (native hosts must
+// pump instance events for delivery, the mapping itself never blocks the
+// context thread).
+#if defined(SOKOL_WGPU)
+#define _SG_GPU_TIMING_WGPU_MAX_NATIVE (128)
+#define _SG_GPU_TIMING_WGPU_QUERY_COUNT (2 * _SG_GPU_TIMING_WGPU_MAX_NATIVE)
+#define _SG_GPU_TIMING_WGPU_RING (4)
+#define _SG_GPU_TIMING_WGPU_BUF_BYTES ((uint64_t)(_SG_GPU_TIMING_WGPU_QUERY_COUNT * 8))
+// Static record per submitted frame, owned by its ring slot (never heap:
+// the record must outlive any sg allocator or context that submitted it).
+// A slot is reused only after its callback freed the ring state, and the
+// callback names its submission via the userdata2 generation token.
+typedef struct {
+    uint32_t gen;
+    int slot;
+    uint32_t serial;
+    uint32_t frame;
+    int native_count;
+    bool overflow;
+    int frame_first, frame_last;    // native indices, exclusive end
+    bool scope_has[SG_MAX_GPU_TIMING_SCOPES];
+    int scope_first[SG_MAX_GPU_TIMING_SCOPES];
+    int scope_last[SG_MAX_GPU_TIMING_SCOPES];
+    WGPUBuffer buf;
+} _sg_gpu_timing_wgpu_meta_t;
+static bool _sg_gpu_timing_wgpu_enabled = false;
+static uint32_t _sg_gpu_timing_wgpu_gen = 0;     // bumped on disable/setup
+static int _sg_gpu_timing_wgpu_probe = 0;        // 0 unprobed, 1 ok, -1 no
+static WGPUQuerySet _sg_gpu_timing_wgpu_qset = 0;
+static WGPUBuffer _sg_gpu_timing_wgpu_resolve = 0;
+static WGPUBuffer _sg_gpu_timing_wgpu_read[_SG_GPU_TIMING_WGPU_RING] = { 0 };
+static uint8_t _sg_gpu_timing_wgpu_state[_SG_GPU_TIMING_WGPU_RING] = { 0 }; // 0 free, 1 submitted, 2 map-pending
+static uint32_t _sg_gpu_timing_wgpu_serial[_SG_GPU_TIMING_WGPU_RING] = { 0 };
+static uint32_t _sg_gpu_timing_wgpu_serial_next = 1;
+static int _sg_gpu_timing_wgpu_cur = 0;          // assembling native count
+static bool _sg_gpu_timing_wgpu_cur_invalid = false;
+static int _sg_gpu_timing_wgpu_open_scope = -1;
+static int _sg_gpu_timing_wgpu_open_first = 0;
+// submit handoff: resolve + copy encode pre-finish, MapAsync post-submit
+// (a map requested before its source copy is submitted could go stale)
+static _sg_gpu_timing_wgpu_meta_t* _sg_gpu_timing_wgpu_pending = 0;
+// slot-owned callback records, one per readback ring slot; no heap use,
+// so no record depends on any sg allocator or context lifetime
+static _sg_gpu_timing_wgpu_meta_t _sg_gpu_timing_wgpu_metas[_SG_GPU_TIMING_WGPU_RING] = { 0 };
+// assembling per-scope native ranges for the committing frame
+static bool _sg_gpu_timing_wgpu_asm_has[SG_MAX_GPU_TIMING_SCOPES] = { false };
+static int _sg_gpu_timing_wgpu_asm_first[SG_MAX_GPU_TIMING_SCOPES] = { 0 };
+static int _sg_gpu_timing_wgpu_asm_last[SG_MAX_GPU_TIMING_SCOPES] = { 0 };
+// published last-completed samples (max frame wins, never mixed)
+static uint32_t _sg_gpu_timing_wgpu_pub_frame = 0;
+static float _sg_gpu_timing_wgpu_pub_ms = -1.0f;
+static float _sg_gpu_timing_wgpu_pub_pms[SG_MAX_GPU_TIMING_SCOPES] = { 0 };
+static uint32_t _sg_gpu_timing_wgpu_pub_pframe[SG_MAX_GPU_TIMING_SCOPES] = { 0 };
+// forward declarations (reset/teardown/begin call helpers defined below)
+_SOKOL_PRIVATE void _sg_gpu_timing_wgpu_scope_end(int pass);
+_SOKOL_PRIVATE void _sg_gpu_timing_wgpu_asm_clear(void);
+// Capability probe, cached per setup. Independent of the enabled intent.
+_SOKOL_PRIVATE bool _sg_gpu_timing_wgpu_usable(void) {
+    if (!_sg.valid || !_sg.wgpu.valid || (0 == _sg.wgpu.dev)) {
+        return false;
+    }
+    if (0 == _sg_gpu_timing_wgpu_probe) {
+        const bool ok = wgpuDeviceHasFeature(_sg.wgpu.dev, WGPUFeatureName_TimestampQuery);
+        _sg_gpu_timing_wgpu_probe = ok ? 1 : -1;
+    }
+    return _sg_gpu_timing_wgpu_probe > 0;
+}
+// Aggregate FIRST start to LAST end over [first, last). Any end < start
+// or >= 10 s span invalidates the sample. An empty range measures
+// nothing, so it is unavailable (-1): no zero is fabricated for
+// unmeasured native work. A measured zero stays a valid 0 ms.
+_SOKOL_PRIVATE float _sg_gpu_timing_wgpu_span_ms(const uint64_t* ts, int first, int last, int count) {
+    if ((first < 0) || (last < first) || (last > count)) {
+        return -1.0f;
+    }
+    if (first == last) {
+        return -1.0f;
+    }
+    const uint64_t start = ts[(size_t)first * 2];
+    const uint64_t end = ts[(size_t)(last - 1) * 2 + 1];
+    if (end < start) {
+        return -1.0f;
+    }
+    const double ms = ((double)(end - start)) / 1000000.0;
+    if ((ms < 0.0) || (ms >= 10000.0)) {
+        return -1.0f;
+    }
+    return (float)ms;
+}
+// Map callback. Runs on the host callback thread/pump. The userdata2
+// generation token is checked against the live generation (plus a live
+// context) BEFORE the meta pointer is dereferenced: a stale token means
+// the slot was reused or the context died, so return touching nothing
+// (no unmap, no free, no publish, no ring write). Only a token match may
+// deref ud1, and the serial guard still tells a same-generation reuse.
+_SOKOL_PRIVATE void _sg_gpu_timing_wgpu_on_mapped(WGPUMapAsyncStatus status, WGPUStringView msg, void* ud1, void* ud2) {
+    _SOKOL_UNUSED(msg);
+    if (!_sg.valid || ((uint32_t)(uintptr_t)ud2 != _sg_gpu_timing_wgpu_gen)) {
+        return;
+    }
+    _sg_gpu_timing_wgpu_meta_t* meta = (_sg_gpu_timing_wgpu_meta_t*)ud1;
+    if (0 == meta) {
+        return;
+    }
+    if ((status == WGPUMapAsyncStatus_Success) && !meta->overflow && (meta->native_count > 0)) {
+        const uint64_t* ts = (const uint64_t*)wgpuBufferGetConstMappedRange(meta->buf, 0, (size_t)(meta->native_count * 2 * 8));
+        if (ts) {
+            const float fms = _sg_gpu_timing_wgpu_span_ms(ts, meta->frame_first, meta->frame_last, meta->native_count);
+            if ((fms >= 0.0f) && (meta->frame > _sg_gpu_timing_wgpu_pub_frame)) {
+                _sg_gpu_timing_wgpu_pub_frame = meta->frame;
+                _sg_gpu_timing_wgpu_pub_ms = fms;
+            }
+            for (int p = 0; p < SG_MAX_GPU_TIMING_SCOPES; p++) {
+                if (meta->scope_has[p]) {
+                    const float pms = _sg_gpu_timing_wgpu_span_ms(ts, meta->scope_first[p], meta->scope_last[p], meta->native_count);
+                    if ((pms >= 0.0f) && (meta->frame > _sg_gpu_timing_wgpu_pub_pframe[p])) {
+                        _sg_gpu_timing_wgpu_pub_pframe[p] = meta->frame;
+                        _sg_gpu_timing_wgpu_pub_pms[p] = pms;
+                    }
+                }
+            }
+        }
+        wgpuBufferUnmap(meta->buf);
+    }
+    if ((meta->slot >= 0) && (meta->slot < _SG_GPU_TIMING_WGPU_RING) &&
+        (_sg_gpu_timing_wgpu_serial[meta->slot] == meta->serial))
+    {
+        _sg_gpu_timing_wgpu_state[meta->slot] = 0;
+    }
+    // slot-owned record: no heap free, the ring slot now owns reuse
+}
+// Lazily create query + resolve objects. Failure skips this frame
+// (fail-closed) and retries on the next one.
+_SOKOL_PRIVATE bool _sg_gpu_timing_wgpu_ensure(void) {
+    if ((0 != _sg_gpu_timing_wgpu_qset) && (0 != _sg_gpu_timing_wgpu_resolve)) {
+        return true;
+    }
+    if (!_sg_gpu_timing_wgpu_usable()) {
+        return false;
+    }
+    _SG_STRUCT(WGPUQuerySetDescriptor, qs_desc);
+    qs_desc.type = WGPUQueryType_Timestamp;
+    qs_desc.count = _SG_GPU_TIMING_WGPU_QUERY_COUNT;
+    _sg_gpu_timing_wgpu_qset = wgpuDeviceCreateQuerySet(_sg.wgpu.dev, &qs_desc);
+    if (0 == _sg_gpu_timing_wgpu_qset) {
+        return false;
+    }
+    _SG_STRUCT(WGPUBufferDescriptor, b_desc);
+    b_desc.usage = WGPUBufferUsage_QueryResolve | WGPUBufferUsage_CopySrc;
+    b_desc.size = _SG_GPU_TIMING_WGPU_BUF_BYTES;
+    _sg_gpu_timing_wgpu_resolve = wgpuDeviceCreateBuffer(_sg.wgpu.dev, &b_desc);
+    if (0 == _sg_gpu_timing_wgpu_resolve) {
+        wgpuQuerySetRelease(_sg_gpu_timing_wgpu_qset);
+        _sg_gpu_timing_wgpu_qset = 0;
+        return false;
+    }
+    return true;
+}
+// Reserve one timestamp pair, returns its query index or -1 (frame
+// invalid from here on: overflow drops the whole sample, never a part).
+_SOKOL_PRIVATE int _sg_gpu_timing_wgpu_stamp(void) {
+    if (!_sg_gpu_timing_wgpu_enabled || _sg_gpu_timing_wgpu_cur_invalid) {
+        return -1;
+    }
+    if (!_sg_gpu_timing_wgpu_ensure()) {
+        _sg_gpu_timing_wgpu_cur_invalid = true;
+        return -1;
+    }
+    if (_sg_gpu_timing_wgpu_cur >= _SG_GPU_TIMING_WGPU_MAX_NATIVE) {
+        _sg_gpu_timing_wgpu_cur_invalid = true;
+        return -1;
+    }
+    const int q = _sg_gpu_timing_wgpu_cur * 2;
+    _sg_gpu_timing_wgpu_cur++;
+    return q;
+}
+// Fill a timestamp-writes struct for query pair q (stack-owned by caller).
+_SOKOL_PRIVATE void _sg_gpu_timing_wgpu_tw(WGPUPassTimestampWrites* tw, int q) {
+    SOKOL_ASSERT(tw && (q >= 0));
+    memset(tw, 0, sizeof(*tw));
+    tw->querySet = _sg_gpu_timing_wgpu_qset;
+    tw->beginningOfPassWriteIndex = (uint32_t)q;
+    tw->endOfPassWriteIndex = (uint32_t)(q + 1);
+}
+// Reset without GPU calls (fresh setup).
+_SOKOL_PRIVATE void _sg_gpu_timing_wgpu_reset(void) {
+    _sg_gpu_timing_wgpu_gen++;
+    _sg_gpu_timing_wgpu_enabled = false;
+    _sg_gpu_timing_wgpu_probe = 0;
+    _sg_gpu_timing_wgpu_qset = 0;
+    _sg_gpu_timing_wgpu_resolve = 0;
+    _sg_gpu_timing_wgpu_pending = 0;
+    for (int i = 0; i < _SG_GPU_TIMING_WGPU_RING; i++) {
+        _sg_gpu_timing_wgpu_read[i] = 0;
+        _sg_gpu_timing_wgpu_state[i] = 0;
+        _sg_gpu_timing_wgpu_serial[i] = 0;
+    }
+    _sg_gpu_timing_wgpu_asm_clear();
+    _sg_gpu_timing_wgpu_pub_frame = 0;
+    _sg_gpu_timing_wgpu_pub_ms = -1.0f;
+    for (int p = 0; p < SG_MAX_GPU_TIMING_SCOPES; p++) {
+        _sg_gpu_timing_wgpu_pub_pms[p] = -1.0f;
+        _sg_gpu_timing_wgpu_pub_pframe[p] = 0;
+    }
+}
+// Full teardown with a live device: abort pending maps (callbacks turn
+// stale via the generation bump), release all objects, then reset.
+_SOKOL_PRIVATE void _sg_gpu_timing_wgpu_teardown(void) {
+    _sg_gpu_timing_wgpu_gen++;
+    _sg_gpu_timing_wgpu_enabled = false;
+    _sg_gpu_timing_wgpu_asm_clear();
+    // encoded-but-never-submitted handoff: no callback can be in flight,
+    // just drop the slot claim (record is slot-owned, nothing to free)
+    if ((0 != _sg_gpu_timing_wgpu_pending) &&
+        (_sg_gpu_timing_wgpu_pending->slot >= 0) &&
+        (_sg_gpu_timing_wgpu_pending->slot < _SG_GPU_TIMING_WGPU_RING))
+    {
+        _sg_gpu_timing_wgpu_state[_sg_gpu_timing_wgpu_pending->slot] = 0;
+    }
+    _sg_gpu_timing_wgpu_pending = 0;
+    for (int i = 0; i < _SG_GPU_TIMING_WGPU_RING; i++) {
+        if (0 != _sg_gpu_timing_wgpu_read[i]) {
+            if (_sg_gpu_timing_wgpu_state[i] == 2) {
+                // map pending: unmap aborts it, the stale callback drops
+                wgpuBufferUnmap(_sg_gpu_timing_wgpu_read[i]);
+            }
+            wgpuBufferRelease(_sg_gpu_timing_wgpu_read[i]);
+            _sg_gpu_timing_wgpu_read[i] = 0;
+            _sg_gpu_timing_wgpu_state[i] = 0;
+        }
+    }
+    if (0 != _sg_gpu_timing_wgpu_resolve) {
+        wgpuBufferRelease(_sg_gpu_timing_wgpu_resolve);
+        _sg_gpu_timing_wgpu_resolve = 0;
+    }
+    if (0 != _sg_gpu_timing_wgpu_qset) {
+        wgpuQuerySetRelease(_sg_gpu_timing_wgpu_qset);
+        _sg_gpu_timing_wgpu_qset = 0;
+    }
+    _sg_gpu_timing_wgpu_probe = 0;
+    _sg_gpu_timing_wgpu_cur = 0;
+    _sg_gpu_timing_wgpu_cur_invalid = false;
+    _sg_gpu_timing_wgpu_pub_frame = 0;
+    _sg_gpu_timing_wgpu_pub_ms = -1.0f;
+    for (int p = 0; p < SG_MAX_GPU_TIMING_SCOPES; p++) {
+        _sg_gpu_timing_wgpu_pub_pms[p] = -1.0f;
+        _sg_gpu_timing_wgpu_pub_pframe[p] = 0;
+    }
+}
+_SOKOL_PRIVATE void _sg_gpu_timing_wgpu_set_enabled(bool enabled) {
+    if (enabled == _sg_gpu_timing_wgpu_enabled) {
+        return; // idempotent: the parent polls this every frame
+    }
+    if (!enabled) {
+        _sg_gpu_timing_wgpu_teardown();
+    } else {
+        _sg_gpu_timing_wgpu_enabled = true;
+    }
+}
+_SOKOL_PRIVATE void _sg_gpu_timing_wgpu_scope_begin(int pass) {
+    if (!_sg_gpu_timing_wgpu_enabled || (pass < 0) || (pass >= SG_MAX_GPU_TIMING_SCOPES)) {
+        return;
+    }
+    if ((_sg_gpu_timing_wgpu_open_scope >= 0) && (_sg_gpu_timing_wgpu_open_scope != pass)) {
+        _sg_gpu_timing_wgpu_scope_end(_sg_gpu_timing_wgpu_open_scope);
+    }
+    _sg_gpu_timing_wgpu_open_scope = pass;
+    _sg_gpu_timing_wgpu_open_first = _sg_gpu_timing_wgpu_cur;
+}
+_SOKOL_PRIVATE float _sg_gpu_timing_wgpu_frame_ms(uint32_t* out_frame) {
+    if (!_sg_gpu_timing_wgpu_enabled) {
+        if (out_frame) { *out_frame = 0; }
+        return -1.0f;
+    }
+    if (out_frame) { *out_frame = _sg_gpu_timing_wgpu_pub_frame; }
+    return (_sg_gpu_timing_wgpu_pub_frame > 0) ? _sg_gpu_timing_wgpu_pub_ms : -1.0f;
+}
+_SOKOL_PRIVATE float _sg_gpu_timing_wgpu_scope_ms(int pass) {
+    if (!_sg_gpu_timing_wgpu_enabled || (pass < 0) || (pass >= SG_MAX_GPU_TIMING_SCOPES)) {
+        return -1.0f;
+    }
+    return (_sg_gpu_timing_wgpu_pub_pframe[pass] > 0) ? _sg_gpu_timing_wgpu_pub_pms[pass] : -1.0f;
+}
+_SOKOL_PRIVATE uint32_t _sg_gpu_timing_wgpu_scope_frame(int pass) {
+    if (!_sg_gpu_timing_wgpu_enabled || (pass < 0) || (pass >= SG_MAX_GPU_TIMING_SCOPES)) {
+        return 0;
+    }
+    return _sg_gpu_timing_wgpu_pub_pframe[pass];
+}
+_SOKOL_PRIVATE void _sg_gpu_timing_wgpu_scope_end(int pass) {
+    if (!_sg_gpu_timing_wgpu_enabled || (pass < 0) || (pass >= SG_MAX_GPU_TIMING_SCOPES)) {
+        return;
+    }
+    if (_sg_gpu_timing_wgpu_open_scope != pass) {
+        return;
+    }
+    _sg_gpu_timing_wgpu_open_scope = -1;
+    // snapshot the assembling range; commit copies it into the meta record
+    _sg_gpu_timing_wgpu_asm_has[pass] = true;
+    _sg_gpu_timing_wgpu_asm_first[pass] = _sg_gpu_timing_wgpu_open_first;
+    _sg_gpu_timing_wgpu_asm_last[pass] = _sg_gpu_timing_wgpu_cur;
+}
+// Clear the assembling frame (ranges + native count), next frame starts new.
+_SOKOL_PRIVATE void _sg_gpu_timing_wgpu_asm_clear(void) {
+    _sg_gpu_timing_wgpu_cur = 0;
+    _sg_gpu_timing_wgpu_cur_invalid = false;
+    _sg_gpu_timing_wgpu_open_scope = -1;
+    for (int p = 0; p < SG_MAX_GPU_TIMING_SCOPES; p++) {
+        _sg_gpu_timing_wgpu_asm_has[p] = false;
+        _sg_gpu_timing_wgpu_asm_first[p] = 0;
+        _sg_gpu_timing_wgpu_asm_last[p] = 0;
+    }
+}
+// Commit hook, called at the top of _sg_wgpu_commit (encoder still open).
+// Force-closes scopes at the frame edge, then resolve + copy for the
+// FIRST-to-LAST native span (MapAsync follows post-submit). Any failure
+// drops the whole frame.
+_SOKOL_PRIVATE void _sg_gpu_timing_wgpu_on_commit(void) {
+    if (_sg_gpu_timing_wgpu_open_scope >= 0) {
+        const int p = _sg_gpu_timing_wgpu_open_scope;
+        _sg_gpu_timing_wgpu_asm_has[p] = true;
+        _sg_gpu_timing_wgpu_asm_first[p] = _sg_gpu_timing_wgpu_open_first;
+        _sg_gpu_timing_wgpu_asm_last[p] = _sg_gpu_timing_wgpu_cur;
+        _sg_gpu_timing_wgpu_open_scope = -1;
+    }
+    if (!_sg_gpu_timing_wgpu_enabled || (0 == _sg.wgpu.cmd_enc) ||
+        _sg_gpu_timing_wgpu_cur_invalid || (_sg_gpu_timing_wgpu_cur <= 0))
+    {
+        _sg_gpu_timing_wgpu_asm_clear();
+        return;
+    }
+    if (!_sg_gpu_timing_wgpu_ensure()) {
+        _sg_gpu_timing_wgpu_asm_clear();
+        return;
+    }
+    int slot = -1;
+    for (int i = 0; i < _SG_GPU_TIMING_WGPU_RING; i++) {
+        if (_sg_gpu_timing_wgpu_state[i] == 0) {
+            if (0 == _sg_gpu_timing_wgpu_read[i]) {
+                _SG_STRUCT(WGPUBufferDescriptor, b_desc);
+                b_desc.usage = WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst;
+                b_desc.size = _SG_GPU_TIMING_WGPU_BUF_BYTES;
+                _sg_gpu_timing_wgpu_read[i] = wgpuDeviceCreateBuffer(_sg.wgpu.dev, &b_desc);
+                if (0 == _sg_gpu_timing_wgpu_read[i]) {
+                    break;
+                }
+            }
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        // ring full (GPU pathologically slow): drop whole frame, never partial
+        _sg_gpu_timing_wgpu_asm_clear();
+        return;
+    }
+    const uint32_t nq = (uint32_t)(_sg_gpu_timing_wgpu_cur * 2);
+    wgpuCommandEncoderResolveQuerySet(_sg.wgpu.cmd_enc, _sg_gpu_timing_wgpu_qset, 0, nq, _sg_gpu_timing_wgpu_resolve, 0);
+    wgpuCommandEncoderCopyBufferToBuffer(_sg.wgpu.cmd_enc, _sg_gpu_timing_wgpu_resolve, 0, _sg_gpu_timing_wgpu_read[slot], 0, _SG_GPU_TIMING_WGPU_BUF_BYTES);
+    // slot-owned record, no heap: safe past any allocator/context lifetime
+    _sg_gpu_timing_wgpu_meta_t* meta = &_sg_gpu_timing_wgpu_metas[slot];
+    memset(meta, 0, sizeof(*meta));
+    meta->gen = _sg_gpu_timing_wgpu_gen;
+    meta->slot = slot;
+    meta->serial = _sg_gpu_timing_wgpu_serial_next++;
+    if (0 == meta->serial) {
+        meta->serial = _sg_gpu_timing_wgpu_serial_next++;
+    }
+    meta->frame = _sg.frame_index;
+    meta->native_count = _sg_gpu_timing_wgpu_cur;
+    meta->frame_first = 0;
+    meta->frame_last = _sg_gpu_timing_wgpu_cur;
+    for (int p = 0; p < SG_MAX_GPU_TIMING_SCOPES; p++) {
+        meta->scope_has[p] = _sg_gpu_timing_wgpu_asm_has[p];
+        meta->scope_first[p] = _sg_gpu_timing_wgpu_asm_first[p];
+        meta->scope_last[p] = _sg_gpu_timing_wgpu_asm_last[p];
+    }
+    meta->buf = _sg_gpu_timing_wgpu_read[slot];
+    _sg_gpu_timing_wgpu_serial[slot] = meta->serial;
+    _sg_gpu_timing_wgpu_state[slot] = 1;
+    _sg_gpu_timing_wgpu_asm_clear();
+    // MapAsync runs post-submit (see _sg_gpu_timing_wgpu_on_submitted)
+    SOKOL_ASSERT(0 == _sg_gpu_timing_wgpu_pending);
+    _sg_gpu_timing_wgpu_pending = meta;
+}
+// Post-submit half: the resolve/copy above is submitted by now, so the
+// mapping waits on real GPU work instead of going stale. No extra waits.
+_SOKOL_PRIVATE void _sg_gpu_timing_wgpu_on_submitted(void) {
+    _sg_gpu_timing_wgpu_meta_t* meta = _sg_gpu_timing_wgpu_pending;
+    _sg_gpu_timing_wgpu_pending = 0;
+    if (0 == meta) {
+        return;
+    }
+    if (!_sg_gpu_timing_wgpu_enabled || (meta->gen != _sg_gpu_timing_wgpu_gen)) {
+        // disabled between encode and submit: drop whole, free the slot
+        // (slot-owned record needs no free)
+        if ((meta->slot >= 0) && (meta->slot < _SG_GPU_TIMING_WGPU_RING) &&
+            (_sg_gpu_timing_wgpu_serial[meta->slot] == meta->serial))
+        {
+            _sg_gpu_timing_wgpu_state[meta->slot] = 0;
+        }
+        return;
+    }
+    _sg_gpu_timing_wgpu_state[meta->slot] = 2;   // map pending
+    _SG_STRUCT(WGPUBufferMapCallbackInfo, cb_info);
+    #if defined(__EMSCRIPTEN__)
+        cb_info.mode = WGPUCallbackMode_AllowSpontaneous;
+    #else
+        cb_info.mode = WGPUCallbackMode_AllowProcessEvents;
+    #endif
+    cb_info.callback = _sg_gpu_timing_wgpu_on_mapped;
+    cb_info.userdata1 = meta;
+    cb_info.userdata2 = (void*)(uintptr_t)meta->gen;
+    wgpuBufferMapAsync(meta->buf, WGPUMapMode_Read, 0, (size_t)_SG_GPU_TIMING_WGPU_BUF_BYTES, cb_info);
+}
+#else
+static bool _sg_gpu_timing_wgpu_unused = false;
+#endif
+
 _SOKOL_PRIVATE bool _sg_wgpu_apply_vertex_buffers(_sg_bindings_ptrs_t* bnd) {
     SOKOL_ASSERT(_sg.wgpu.rpass_enc);
     for (uint32_t slot = 0; slot < SG_MAX_VERTEXBUFFER_BINDSLOTS; slot++) {
@@ -19161,6 +20311,8 @@ _SOKOL_PRIVATE void _sg_wgpu_setup_backend(const sg_desc* desc) {
     SOKOL_ASSERT(desc);
     SOKOL_ASSERT(desc->environment.wgpu.device);
     SOKOL_ASSERT(desc->uniform_buffer_size > 0);
+    // GPU TIMINGS: fresh context starts off with no objects
+    _sg_gpu_timing_wgpu_reset();
     _sg.wgpu.valid = true;
     _sg.wgpu.dev = (WGPUDevice) desc->environment.wgpu.device;
     _sg.wgpu.queue = wgpuDeviceGetQueue(_sg.wgpu.dev);
@@ -19175,6 +20327,8 @@ _SOKOL_PRIVATE void _sg_wgpu_setup_backend(const sg_desc* desc) {
 
 _SOKOL_PRIVATE void _sg_wgpu_discard_backend(void) {
     SOKOL_ASSERT(_sg.wgpu.valid);
+    // GPU TIMINGS: abort pending maps, release timing objects
+    _sg_gpu_timing_wgpu_teardown();
     _sg.wgpu.valid = false;
     _sg_wgpu_discard_all_bindgroups();
     _sg_wgpu_bindgroups_cache_discard();
@@ -19909,6 +21063,13 @@ _SOKOL_PRIVATE void _sg_wgpu_init_ds_att(WGPURenderPassDepthStencilAttachment* w
 _SOKOL_PRIVATE void _sg_wgpu_begin_compute_pass(const sg_pass* pass) {
     _SG_STRUCT(WGPUComputePassDescriptor, wgpu_pass_desc);
     wgpu_pass_desc.label = _sg_wgpu_stringview(pass->label);
+    // GPU TIMINGS: attach timestamp writes at creation (consumed here)
+    WGPUPassTimestampWrites timing_tw;
+    const int timing_q = _sg_gpu_timing_wgpu_stamp();
+    if (timing_q >= 0) {
+        _sg_gpu_timing_wgpu_tw(&timing_tw, timing_q);
+        wgpu_pass_desc.timestampWrites = &timing_tw;
+    }
     _sg.wgpu.cpass_enc = wgpuCommandEncoderBeginComputePass(_sg.wgpu.cmd_enc, &wgpu_pass_desc);
     SOKOL_ASSERT(_sg.wgpu.cpass_enc);
     // clear initial bindings
@@ -19958,6 +21119,13 @@ _SOKOL_PRIVATE void _sg_wgpu_begin_render_pass(const sg_pass* pass, const _sg_at
             wgpu_pass_desc.depthStencilAttachment = &wgpu_ds_att;
         }
     }
+    // GPU TIMINGS: attach timestamp writes at creation (consumed below)
+    WGPUPassTimestampWrites timing_tw;
+    const int timing_q = _sg_gpu_timing_wgpu_stamp();
+    if (timing_q >= 0) {
+        _sg_gpu_timing_wgpu_tw(&timing_tw, timing_q);
+        wgpu_pass_desc.timestampWrites = &timing_tw;
+    }
     _sg.wgpu.rpass_enc = wgpuCommandEncoderBeginRenderPass(_sg.wgpu.cmd_enc, &wgpu_pass_desc);
     SOKOL_ASSERT(_sg.wgpu.rpass_enc);
 
@@ -20002,6 +21170,8 @@ _SOKOL_PRIVATE void _sg_wgpu_end_pass(const _sg_attachments_ptrs_t* atts) {
 }
 
 _SOKOL_PRIVATE void _sg_wgpu_commit(void) {
+    // GPU TIMINGS: resolve + copy + MapAsync while encoder is open
+    _sg_gpu_timing_wgpu_on_commit();
     if (!_sg.wgpu.cmd_enc) {
         // no valid pass in this frame
         return;
@@ -20013,6 +21183,8 @@ _SOKOL_PRIVATE void _sg_wgpu_commit(void) {
     wgpuCommandEncoderRelease(_sg.wgpu.cmd_enc);
     _sg.wgpu.cmd_enc = 0;
     wgpuQueueSubmit(_sg.wgpu.queue, 1, &wgpu_cmd_buf);
+    // GPU TIMINGS: map the readback now that its copy submitted
+    _sg_gpu_timing_wgpu_on_submitted();
     wgpuCommandBufferRelease(wgpu_cmd_buf);
 }
 
@@ -27697,121 +28869,146 @@ SOKOL_API_IMPL void sg_commit(void) {
     _SG_TRACE_NOARGS(commit);
     _sg.frame_index++;
 }
-// AGATE GPU TIMINGS (agate fork patch) ---
-SOKOL_API_IMPL void sg_agate_set_gpu_timing_enabled(bool enabled) {
+// GPU TIMINGS ---
+// Fail-closed without a valid context (no asserts here: the parent polls
+// the setter every frame). Capabilities ignore the enabled intent, the
+// setter is idempotent on repeat flags. See the header top for scope.
+SOKOL_API_IMPL void sg_set_gpu_timing_enabled(bool enabled) {
+    if (!_sg.valid) {
+        return;
+    }
     #if defined(SOKOL_METAL)
-        _sg_agate_gpu_timing_enabled = enabled;
-    #endif
-    // AGATE GPU TIMINGS v2: mirror into the GL timer pool (no-op stub
-    // outside GLCORE-non-Win32 builds; disable also deletes live queries).
-    _sg_agate_gl_apply_enabled(enabled);
-    #if defined(SOKOL_METAL)
-        if (!enabled) {
-            if (nil != _sg_agate_gpu_cb) {
-                [_sg_agate_gpu_cb release];
-                _sg_agate_gpu_cb = nil;
-            }
-            _sg_agate_gpu_last_ms = -1.0f;
-        }
-    #endif
-}
-SOKOL_API_IMPL float sg_agate_query_gpu_frame_ms(void) {
-    #if defined(SOKOL_METAL)
-        if (!_sg_agate_gpu_timing_enabled || (nil == _sg_agate_gpu_cb)) {
-            return -1.0f;
-        }
-        _sg_agate_gpu_sample(_sg_agate_gpu_cb);
-        // Last-completed semantics: the value lags one frame behind the
-        // CPU submit (async GPU execution). -1 until the first completion.
-        return _sg_agate_gpu_last_ms;
+        _sg_gpu_timing_mtl_set_enabled(enabled);
+    #elif defined(SOKOL_WGPU)
+        _sg_gpu_timing_wgpu_set_enabled(enabled);
     #elif defined(SOKOL_GLCORE) && !defined(_WIN32)
-        // AGATE GPU TIMINGS v2: GL frame time is the sum of the
-        // last-completed per-pass TIME_ELAPSED values (passes with no
-        // sample yet contribute 0). GPU work is serial, so this is a
-        // lower bound of the true frame span: inter-pass bubbles are
-        // excluded. -1 until the first sample. Drains first so the sum
-        // is as fresh as the last completed query.
-        if (!_sg_agate_gl_enabled) {
+        _sg_gpu_timing_gl_apply_enabled(enabled);
+    #else
+        _SOKOL_UNUSED(enabled);
+    #endif
+}
+SOKOL_API_IMPL float sg_query_gpu_frame_ms(void) {
+    if (!_sg.valid) {
+        return -1.0f;
+    }
+    #if defined(SOKOL_METAL)
+        return _sg_gpu_timing_mtl_frame_ms(0);
+    #elif defined(SOKOL_WGPU)
+        return _sg_gpu_timing_wgpu_frame_ms(0);
+    #elif defined(SOKOL_GLCORE) && !defined(_WIN32)
+        if (!_sg_gpu_timing_gl_enabled) {
             return -1.0f;
         }
-        _sg_agate_gl_drain_all();
-        {
-            float sum_ms = 0.0f;
-            bool any = false;
-            int p;
-            for (p = 0; p < _SG_AGATE_GPU_PASSES; p++) {
-                if (_sg_agate_gl_last_ms[p] >= 0.0f) {
-                    sum_ms += _sg_agate_gl_last_ms[p];
-                    any = true;
-                }
-            }
-            return any ? sum_ms : -1.0f;
-        }
+        return _sg_gpu_timing_gl_frame_ms(0);
     #else
         return -1.0f;
     #endif
 }
-#if !defined(_SOKOL_ANY_GL)
-// AGATE GPU TIMINGS v2: the GL-state block above lives inside the GL-only
-// region, so on Metal/dummy builds (no `_SOKOL_ANY_GL`) the helpers are
-// defined here instead. Same fail-closed stubs as the in-region `#else`
-// arm (which serves Win32-GL/GLES builds where the region IS compiled).
-_SOKOL_PRIVATE void _sg_agate_gl_apply_enabled(bool enabled) {
-    (void)enabled;
-}
-_SOKOL_PRIVATE void _sg_agate_gl_drain_all(void) {
-}
-#endif
-// AGATE GPU TIMINGS v2 (per-pass entry points) ---
-SOKOL_API_IMPL void sg_agate_gpu_pass_begin(int pass) {
-    #if defined(SOKOL_GLCORE) && !defined(_WIN32)
-        GLuint q;
-        if (!_sg_agate_gl_enabled || (pass < 0) || (pass >= _SG_AGATE_GPU_PASSES)) {
-            return;
-        }
-        _sg_agate_gl_close_active();
-        _sg_agate_gl_reap(pass);
-        if (_sg_agate_gl_pending[pass] >= _SG_AGATE_GPU_QUERY_DEPTH) {
-            // Ring full, oldest still in flight: drop this sample, never stall.
-            return;
-        }
-        q = _sg_agate_gl_queries[pass][_sg_agate_gl_head[pass]];
-        if (0 == q) {
-            glGenQueries(1, &q);
-            if (0 == q) {
-                return;
-            }
-            _sg_agate_gl_queries[pass][_sg_agate_gl_head[pass]] = q;
-        }
-        glBeginQuery(GL_TIME_ELAPSED, q);
-        _sg_agate_gl_active = pass;
+SOKOL_API_IMPL void sg_gpu_timing_scope_begin(int scope) {
+    if (!_sg.valid) {
+        return;
+    }
+    #if defined(SOKOL_METAL)
+        _sg_gpu_timing_mtl_scope_begin(scope);
+    #elif defined(SOKOL_WGPU)
+        _sg_gpu_timing_wgpu_scope_begin(scope);
+    #elif defined(SOKOL_GLCORE) && !defined(_WIN32)
+        _sg_gpu_timing_gl_scope_begin(scope);
     #else
-        _SOKOL_UNUSED(pass);
+        _SOKOL_UNUSED(scope);
     #endif
 }
-SOKOL_API_IMPL void sg_agate_gpu_pass_end(int pass) {
-    #if defined(SOKOL_GLCORE) && !defined(_WIN32)
-        if (!_sg_agate_gl_enabled || (pass < 0) || (pass >= _SG_AGATE_GPU_PASSES)) {
-            return;
-        }
-        if (_sg_agate_gl_active == pass) {
-            _sg_agate_gl_close_active();
-        }
+SOKOL_API_IMPL void sg_gpu_timing_scope_end(int scope) {
+    if (!_sg.valid) {
+        return;
+    }
+    #if defined(SOKOL_METAL)
+        _sg_gpu_timing_mtl_scope_end(scope);
+    #elif defined(SOKOL_WGPU)
+        _sg_gpu_timing_wgpu_scope_end(scope);
+    #elif defined(SOKOL_GLCORE) && !defined(_WIN32)
+        _sg_gpu_timing_gl_scope_end(scope);
     #else
-        _SOKOL_UNUSED(pass);
+        _SOKOL_UNUSED(scope);
     #endif
 }
-SOKOL_API_IMPL float sg_agate_query_gpu_pass_ms(int pass) {
-    #if defined(SOKOL_GLCORE) && !defined(_WIN32)
-        if (!_sg_agate_gl_enabled || (pass < 0) || (pass >= _SG_AGATE_GPU_PASSES)) {
-            return -1.0f;
-        }
-        _sg_agate_gl_reap(pass);
-        // Last-completed semantics, like the v1 frame timer.
-        return _sg_agate_gl_last_ms[pass];
-    #else
-        _SOKOL_UNUSED(pass);
+SOKOL_API_IMPL float sg_query_gpu_scope_ms(int scope) {
+    if (!_sg.valid) {
         return -1.0f;
+    }
+    #if defined(SOKOL_METAL)
+        return _sg_gpu_timing_mtl_scope_ms(scope);
+    #elif defined(SOKOL_WGPU)
+        return _sg_gpu_timing_wgpu_scope_ms(scope);
+    #elif defined(SOKOL_GLCORE) && !defined(_WIN32)
+        return _sg_gpu_timing_gl_scope_ms(scope);
+    #else
+        _SOKOL_UNUSED(scope);
+        return -1.0f;
+    #endif
+}
+SOKOL_API_IMPL bool sg_gpu_frame_timing_supported(void) {
+    if (!_sg.valid) {
+        return false;
+    }
+    #if defined(SOKOL_METAL)
+        // full command-buffer GPU times exist on every Metal device
+        return true;
+    #elif defined(SOKOL_WGPU)
+        return _sg_gpu_timing_wgpu_usable();
+    #elif defined(SOKOL_GLCORE) && !defined(_WIN32)
+        return _sg_gpu_timing_gl_supported();
+    #else
+        return false;
+    #endif
+}
+SOKOL_API_IMPL bool sg_gpu_scope_timing_supported(void) {
+    if (!_sg.valid) {
+        return false;
+    }
+    #if defined(SOKOL_METAL)
+        return _sg_gpu_timing_mtl_counters_usable();
+    #elif defined(SOKOL_WGPU)
+        return _sg_gpu_timing_wgpu_usable();
+    #elif defined(SOKOL_GLCORE) && !defined(_WIN32)
+        return _sg_gpu_timing_gl_supported();
+    #else
+        return false;
+    #endif
+}
+SOKOL_API_IMPL uint32_t sg_query_gpu_frame_index(void) {
+    // snapshot reader: tag of the last frame ms query, no GPU poll
+    if (!_sg.valid) {
+        return 0;
+    }
+    #if defined(SOKOL_METAL)
+        return _sg_gpu_timing_mtl_frame_index();
+    #elif defined(SOKOL_WGPU)
+        uint32_t frame = 0;
+        _sg_gpu_timing_wgpu_frame_ms(&frame);
+        return frame;
+    #elif defined(SOKOL_GLCORE) && !defined(_WIN32)
+        if (!_sg_gpu_timing_gl_enabled) {
+            return 0;
+        }
+        return _sg_gpu_timing_gl_frame_index();
+    #else
+        return 0;
+    #endif
+}
+SOKOL_API_IMPL uint32_t sg_query_gpu_scope_frame_index(int scope) {
+    if (!_sg.valid) {
+        return 0;
+    }
+    #if defined(SOKOL_METAL)
+        return _sg_gpu_timing_mtl_scope_frame(scope);
+    #elif defined(SOKOL_WGPU)
+        return _sg_gpu_timing_wgpu_scope_frame(scope);
+    #elif defined(SOKOL_GLCORE) && !defined(_WIN32)
+        return _sg_gpu_timing_gl_scope_frame(scope);
+    #else
+        _SOKOL_UNUSED(scope);
+        return 0;
     #endif
 }
 // ---------------------------------------------------------------------------
