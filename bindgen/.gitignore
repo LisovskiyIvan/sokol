@@ -1,3 +1,4 @@
-out/
-__pycache__/
 sokol-*/
+sokol-zig
+__pycache__/
+out/
