@@ -2086,6 +2086,7 @@ typedef struct sapp_desc {
     bool srgb;                          // request sRGB framebuffer (not supported on WebGL)
     bool hdr;                           // request HDR framebuffer (highly experimental, only supported on macOS+Metal and WebGPU)
     bool disable_vsync;                 // optional and with differing behaviour, consider this a debugging feature!
+    bool wgpu_gpu_timing_enabled;       // request WGPU TimestampQuery feature for GPU timings (default: false, unsupported adapters still init)
     bool high_dpi;                      // whether the rendering canvas is full-resolution on HighDPI displays
     bool fullscreen;                    // whether the window should be created in fullscreen mode
     const char* window_title;           // the window title as UTF-8 encoded string
@@ -4247,6 +4248,14 @@ _SOKOL_PRIVATE void _sapp_wgpu_create_device_and_swapchain(void) {
     if (wgpuAdapterHasFeature(_sapp.wgpu.adapter, WGPUFeatureName_TextureFormatsTier2)) {
         SOKOL_ASSERT(cur_feature_index < _SAPP_WGPU_MAX_REQUESTED_FEATURES);
         requiredFeatures[cur_feature_index++] = WGPUFeatureName_TextureFormatsTier2;
+    }
+    // GPU TIMINGS: opt-in timestamp queries, only when the adapter
+    // has the feature (unsupported adapters still initialize, default off).
+    if (_sapp.desc.wgpu_gpu_timing_enabled &&
+        wgpuAdapterHasFeature(_sapp.wgpu.adapter, WGPUFeatureName_TimestampQuery))
+    {
+        SOKOL_ASSERT(cur_feature_index < _SAPP_WGPU_MAX_REQUESTED_FEATURES);
+        requiredFeatures[cur_feature_index++] = WGPUFeatureName_TimestampQuery;
     }
     #undef _SAPP_WGPU_MAX_REQUESTED_FEATURES
 

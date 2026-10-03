@@ -43,4 +43,11 @@ if (BACKEND_MOCK_ONLY AND SOKOL_BACKEND STREQUAL SOKOL_METAL AND OSX_MACOS)
     add_subdirectory(metal)
 endif()
 
+# Headless WGPU timing-callback test. Standalone only, needs an external
+# <webgpu/webgpu.h>: skipped unless WEBGPU_INCLUDE_DIR is set, so normal
+# presets (which never set it) are unaffected.
+if (DEFINED WEBGPU_INCLUDE_DIR)
+    add_subdirectory(wgpu)
+endif()
+
 endif()
